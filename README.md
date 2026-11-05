@@ -1,10 +1,14 @@
-# Network Troubleshooter
+# Network Troubleshooter for Linux
 
-Check one Wi-Fi or Ethernet adapter at a time. The checklist shows link, IP address, route, gateway, public ping, DNS, captive sign-in, and HTTPS. Open it from the application launcher even when the internet is down.
+Find out why a Wi-Fi or Ethernet connection stopped working. Pick an adapter and check its link, IP address, route, gateway, DNS, captive portal, and internet access. A working Wi-Fi connection can stay up while you test an Ethernet port that stopped working.
+
+Use the desktop app or run the same checks in a terminal. You can diagnose a connection, retry a saved profile, and open a sign-in page during an outage. Local checks and repairs run on your machine and need no AI account.
 
 ## Install
 
-Network Troubleshooter uses Python 3, NetworkManager, iproute2, iputils, curl, systemd, YAD, and xdg-utils. On Arch, install any missing packages before an outage. Per-adapter DNS checks use systemd-resolved when it is running.
+You need **Linux with NetworkManager**. The checks use Python 3, `ip` from iproute2, `ping` from iputils, curl, and systemd's journal tools. Install YAD for the desktop UI and xdg-utils for browser sign-in on desktops without Omarchy's portal helper. The app uses systemd-resolved for per-adapter DNS checks when available, `iw` for Wi-Fi link details, and `wl-copy` to copy reports on Wayland.
+
+Run as your desktop user.
 
 ```sh
 git clone https://github.com/muness/network-troubleshooter.git
@@ -12,13 +16,35 @@ cd network-troubleshooter
 python3 install.py
 ```
 
-Open **Network Troubleshooter** and choose an adapter. **Repair connection** retries its saved NetworkManager profile after you confirm. If that profile is still active after a failed attempt, the app disconnects the adapter and retries the same profile. One repair can run per adapter at a time.
+Search for **Network Troubleshooter** in your app launcher. The installer puts the command in `~/.local/bin`. Use that path in the examples below if the directory is outside your `PATH`.
 
-**Open sign-in** appears when NetworkManager detects a portal. **Try sign-in** is available when the adapter is connected but the check cannot verify internet access or a portal. A configured helper can bind browser traffic to the selected adapter. Otherwise the app uses Omarchy's helper or opens the HTTP probe in the default browser, which follows system routing.
+## Use it from OmaDoctor on Omarchy
 
-**View report** opens the private evidence, including recent adapter logs and before-and-after repair results. Wi-Fi details include radio state, association and signal from `iw` when available, and cached visibility for the saved profile. **Copy redacted** copies check statuses and repair outcomes, with no raw logs or connection identifiers. Copying requires `wl-copy`. Private reports are saved under `${XDG_STATE_HOME:-$HOME/.local/state}/network-troubleshooter/`.
+OmaDoctor is a diagnostics widget for Omarchy. The **Network** button is available to try in its draft launcher PR. [OmaDoctor project](https://github.com/Davedes83/OmaDoctor) · [Draft PR #9](https://github.com/Davedes83/OmaDoctor/pull/9)
 
-## Command line
+With that version of OmaDoctor and this app installed, click **Network** next to **Ask AI**. The button opens Network Troubleshooter locally, even before an OmaDoctor scan finishes. OmaDoctor sends no report to the app.
+
+In OmaDoctor's widget settings, **Network troubleshooter app** defaults to `auto`, which shows the button when this app is installed. Its desktop ID is `io.github.muness.NetworkTroubleshooter.desktop`. Enter a different desktop app ID to use another tool, or clear the field to hide the button.
+
+For a fresh OmaDoctor install, try the draft branch with Omarchy's plugin manager.
+
+```sh
+git clone --branch codex/network-troubleshooter-launcher https://github.com/muness/OmaDoctor.git omadoctor-preview
+omarchy plugin add "$PWD/omadoctor-preview" --enable
+```
+
+## Read the checklist
+
+- **Link and IP address** show whether the Ethernet cable has a link or Wi-Fi joined, and whether the adapter got an IPv4 or IPv6 address beyond link-local. Wi-Fi details include the radio state, association, signal, and cached visibility of the saved network when available.
+- **Route, Gateway, and Ping** separate a missing route from a router or public IP that gives no reply. The public targets are `1.1.1.1` and `2606:4700:4700::1111`. Use **Ping target** to try a different IP for this session.
+- **DNS and Internet** check `archlinux.org`. The HTTPS request uses the selected adapter. It may use system DNS if the app cannot verify per-adapter DNS. A successful HTTPS request still verifies internet access if ping gets no reply.
+- **Sign-in** offers **Open sign-in** for a detected captive portal and **Try sign-in** when the result is inconclusive. The system browser uses normal routing. An optional helper can bind sign-in to the selected adapter.
+
+**Repair connection** retries the saved NetworkManager profile after you confirm. If the retry fails and that profile is still active, the app disconnects the selected adapter and retries the same profile. It runs one repair at a time per adapter and checks the connection again afterward.
+
+**View report** shows recent adapter logs and before-and-after repair results. The full report can contain IP addresses, network names, and log messages. Private reports are saved under `${XDG_STATE_HOME:-$HOME/.local/state}/network-troubleshooter/`. Use **Copy redacted** to share check statuses and repair outcomes without the raw evidence.
+
+## Use it from a terminal
 
 ```sh
 network-troubleshooter --list-adapters
@@ -28,17 +54,11 @@ network-troubleshooter --device enp2s0 --repair --report
 network-troubleshooter --device wlan0 --sign-in
 ```
 
-Select the adapter with `--device` when more than one is present. Repair asks for confirmation in a terminal. Use `--repair --yes` for automation. `--report` prints private evidence. Use `--redacted-report` for output you can share. The path to the private report goes to stderr.
+Use the adapter name from `--list-adapters`. Repair prompts for confirmation in a terminal. Add `--yes` to confirm it in a script. `--report` prints the private report and `--redacted-report` prints the shareable one. The saved private report path goes to stderr.
 
-The route check looks for a path to `1.1.1.1` and `2606:4700:4700::1111` without sending packets. **Gateway** pings the router addresses supplied by NetworkManager. **Ping** tests the public targets through the selected adapter. Choose **Ping target** or pass `--ping-target` to override the public test for the session. **Use defaults** restores it in the GUI. The HTTPS result can still show internet access if ping gets no reply.
+## Configure a driver recovery service
 
-DNS and HTTPS use `archlinux.org` as a test site. HTTPS binds to the selected adapter. If per-adapter DNS cannot be verified, HTTPS may use the system resolver. An unverified probe identifies the failed check, and the app leaves the cause open.
-
-The desktop entry ID is `io.github.muness.NetworkTroubleshooter.desktop`. The app runs as your user. The checks and controls are local and do not require an AI account.
-
-## Optional driver recovery
-
-If your system already has a guarded systemd recovery service, you can associate it with one adapter in `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshooter/recovery.json`.
+If your system already has a guarded systemd recovery service, put its adapter, saved NetworkManager profile UUID, driver name, and unit in `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshooter/recovery.json`.
 
 ```json
 {
@@ -49,11 +69,11 @@ If your system already has a guarded systemd recovery service, you can associate
 }
 ```
 
-Set the adapter name, saved NetworkManager profile UUID, actual kernel driver name, and installed system service. After a failed reconnect, the app can start that service via polkit if the driver still matches and the adapter is disconnected. The Wi-Fi guard needs `iw` and exactly one Wi-Fi adapter visible to NetworkManager. The service itself should check hardware support and safely restore the adapter. Without this configuration, the app uses the NetworkManager repair for Wi-Fi and Ethernet.
+After a failed reconnect, the app can ask for polkit authentication and start that unit if the adapter is disconnected and its driver still matches. Wi-Fi recovery requires `iw` and exactly one Wi-Fi adapter visible to NetworkManager. The service is responsible for verifying hardware support and restoring the adapter safely.
 
-## Optional interface-bound sign-in
+## Configure an interface-bound sign-in helper
 
-In the same configuration directory, put an argument list under `wifi`, `ethernet`, or both in `portal.json`. The executable path must be absolute. The app appends the selected adapter name and the HTTP probe URL as separate arguments. The helper should return after launching the login window and report a nonzero exit if it cannot start.
+Put an argument list under `wifi`, `ethernet`, or both in `portal.json` in the same configuration directory.
 
 ```json
 {
@@ -61,6 +81,10 @@ In the same configuration directory, put an argument list under `wifi`, `etherne
 }
 ```
 
+The executable path must be absolute. The app passes the selected adapter name and HTTP probe URL as two additional arguments. The helper should return after opening the login window, or exit nonzero if launch fails. With no helper configured for that adapter type, the app uses Omarchy's captive-portal helper if available or opens the probe URL in the default browser.
+
 ## Uninstall
 
-To uninstall, remove `~/.local/bin/network-troubleshooter` and `io.github.muness.NetworkTroubleshooter.desktop` from your user applications directory (`~/.local/share/applications` by default).
+Remove the command at `~/.local/bin/network-troubleshooter` and the entry named `io.github.muness.NetworkTroubleshooter.desktop` in your user applications directory, usually `~/.local/share/applications`.
+
+[MIT license](LICENSE)
