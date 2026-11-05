@@ -52,26 +52,47 @@ network-troubleshooter --device wlan0 --sign-in
 
 Use the interface name from `--list-adapters`. Repair prompts in a terminal. Add `--yes` for scripts. `--report` prints private evidence. Share the stdout of `--redacted-report`. The private report path goes to stderr.
 
-## Optional recovery and sign-in helpers
+## Configure a driver recovery service
 
-Store these files under `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshooter/`.
+**Repair connection** retries the saved profile first. If that fails, it can start a systemd recovery service through polkit. The adapter must be disconnected, allow autoconnect, and still use the configured driver. Wi-Fi also requires `iw`, an enabled radio, and exactly one Wi-Fi adapter visible to NetworkManager.
 
-### `recovery.json`
+### Broadcom Wi-Fi on Apple Silicon
 
-Point to a guarded systemd service you already have. After a failed reconnect, the app starts the configured unit through polkit if the adapter is disconnected and the driver matches. The service must check hardware support and restore the adapter. The Wi-Fi guard requires `iw` and exactly one Wi-Fi adapter visible to NetworkManager.
+After suspend on Linux, Broadcom Wi-Fi can get stuck. NetworkManager keeps trying to join, and the journal can show repeated `ASSOC-REJECT status_code=16` or scan errors. A `brcmfmac` reload can restore the connection. The issue has been reported on M1 and M2 models. [BCM4378/BCM4387 resume fix](https://github.com/omacom/omarchy-mac/pull/255) · [M2 Pro report](https://github.com/omacom/omarchy/issues/10857) · [M2 Air report](https://github.com/AsahiLinux/linux/issues/439)
 
-```json
-{
-  "adapter": "wlan0",
-  "profile": "00000000-0000-4000-8000-000000000000",
-  "driver": "driver_name",
-  "unit": "wifi-recovery.service"
-}
+Run `lspci -nnk -d 14e4:` to find the PCI ID and check for `Kernel driver in use: brcmfmac`. The helper supports BCM4378 (`14e4:4425`, found in M1 Macs), BCM4387 (`14e4:4433`, found in M1 Pro and Max Macs), and BCM4388 (`14e4:4434`, found in some M2 and M3 Macs). Use the PCI ID to select the helper. It requires ARM64, NetworkManager, wpa_supplicant, and the loadable `brcmfmac` and `brcmfmac_wcc` kernel modules. [Broadcom chip IDs](https://github.com/omacom/omarchy/issues/7439) · [Asahi Linux driver notes](https://asahilinux.org/2024/01/fedora-asahi-new/)
+
+If joins also fail right after a fresh boot, check whether an older Omarchy installation set `feature_disable=0x82000` in `/etc/modprobe.d/brcmfmac.conf`. That setting caused association failures on BCM4387. Follow the Omarchy cleanup instructions for that case. [Omarchy Apple Silicon troubleshooting](https://omarchylinux.org/hardware/apple-silicon-asahi/) · [BCM4387 report](https://github.com/omacom/omarchy/issues/7439)
+
+If you already have a guarded recovery service for your chip, use its unit name in the next section. The Broadcom helper below detaches NetworkManager and wpa_supplicant before unloading the driver, then restores NetworkManager management. These commands install it and disable its automatic wake hook so it runs on demand from **Repair connection**. [Helper source](https://github.com/muness/dotfiles/tree/53aacf6c6606a88b7d0acaca6a9d5dbf58e2e60e/scripts/linux/wifi-resume)
+
+```sh
+git clone https://github.com/muness/dotfiles.git broadcom-recovery &&
+  git -C broadcom-recovery checkout 53aacf6c6606a88b7d0acaca6a9d5dbf58e2e60e &&
+  pkexec /usr/bin/python3 "$PWD/broadcom-recovery/scripts/linux/wifi-resume/install.py" &&
+  pkexec /usr/bin/systemctl disable dotfiles-wifi-resume.service
 ```
 
-### `portal.json`
+Use `dotfiles-wifi-resume.service` in the next step. The reload briefly removes the Wi-Fi adapter. Check the service log with `journalctl -b -u dotfiles-wifi-resume.service`.
 
-Set a helper for `wifi`, `ethernet`, or both. Start each argument list with an absolute executable path. The app appends the adapter name and HTTP probe URL. Return after opening the window, or exit nonzero if launch fails.
+### Connect the service to Network Troubleshooter
+
+Run the setup as your desktop user. Find the interface and saved profile UUID, then substitute those values and your unit name.
+
+```sh
+network-troubleshooter --list-adapters
+nmcli -f NAME,UUID,TYPE connection show
+network-troubleshooter --configure-recovery dotfiles-wifi-resume.service \
+  --device wlan0 --profile YOUR_PROFILE_UUID
+```
+
+This writes or replaces `recovery.json` under `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshooter/` and records the detected driver. Run setup again if you recreate the profile. Delete that file to remove the service from Network Troubleshooter.
+
+Use **Repair connection** in the desktop app or `network-troubleshooter --device wlan0 --repair`. For Ethernet or another Wi-Fi driver, use the same setup command with a system service that checks its own hardware support and restores the adapter after recovery.
+
+## Configure a sign-in helper
+
+Save `portal.json` under `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshooter/`. Set a helper for `wifi`, `ethernet`, or both. Start each argument list with an absolute executable path. The app appends the adapter name and HTTP probe URL. Return after opening the window, or exit nonzero if launch fails.
 
 ```json
 {

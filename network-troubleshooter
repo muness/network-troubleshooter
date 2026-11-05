@@ -25,6 +25,7 @@ FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
 ENV = {**os.environ, 'LC_ALL': 'C'}
 CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter'
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
+RECOVERY_UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service')
 
 
 def run(*args, timeout=5):
@@ -310,16 +311,20 @@ def recovery_settings():
         device, profile, driver, unit = (config[key] for key in ('adapter', 'profile', 'driver', 'unit'))
         if (re.fullmatch(r'[a-fA-F0-9-]{36}', profile)
                 and re.fullmatch(r'[A-Za-z0-9_-]+', driver)
-                and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service', unit)):
+                and RECOVERY_UNIT.fullmatch(unit)):
             return device, profile, driver, unit
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
 
 
-def driver_recovery_allowed(device, kind, driver):
+def adapter_driver(device):
     link = Path('/sys/class/net') / device / 'device/driver'
-    if not link.is_symlink() or link.resolve().name != driver:
+    return link.resolve().name if link.is_symlink() else ''
+
+
+def driver_recovery_allowed(device, kind, driver):
+    if adapter_driver(device) != driver:
         return False
     if run('nmcli', '-g', 'GENERAL.AUTOCONNECT', 'device', 'show', device) != (0, 'yes'):
         return False
@@ -332,15 +337,48 @@ def driver_recovery_allowed(device, kind, driver):
             and run('nmcli', '-g', 'WIFI', 'radio') == (0, 'enabled'))
 
 
+def profile_matches_kind(profile, kind):
+    connection_type = '802-11-wireless' if kind == 'Wi-Fi' else '802-3-ethernet'
+    return run('nmcli', '-g', 'connection.type', 'connection', 'show', 'uuid', profile) == (0, connection_type)
+
+
+def recovery_unit_loaded(unit):
+    return run('/usr/bin/systemctl', 'show', '-p', 'LoadState', '--value', unit) == (0, 'loaded')
+
+
+def configure_recovery(device, profile, unit):
+    if os.geteuid() == 0:
+        raise ValueError('Run recovery setup as your desktop user.')
+    if not RECOVERY_UNIT.fullmatch(unit):
+        raise ValueError('Enter a systemd .service unit name.')
+    devices, error = adapters()
+    kind = next((kind for name, kind, _ in devices if name == device), None)
+    if not kind:
+        raise ValueError(error or f'{device} is not a managed Wi-Fi or Ethernet adapter.')
+    driver = adapter_driver(device)
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', driver):
+        raise ValueError(f'Could not identify the driver for {device}.')
+    if not re.fullmatch(r'[a-fA-F0-9-]{36}', profile) or not profile_matches_kind(profile, kind):
+        raise ValueError(f'Enter the UUID of a saved {kind} profile.')
+    if not recovery_unit_loaded(unit):
+        raise ValueError(f'Install {unit} as a system service first.')
+
+    config = dict(adapter=device, profile=profile, driver=driver, unit=unit)
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = CONFIG_DIR / 'recovery.json'
+    with tempfile.TemporaryDirectory(dir=CONFIG_DIR) as directory:
+        staged = Path(directory) / path.name
+        staged.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+        staged.replace(path)
+    return path
+
+
 def configured_recovery(device, kind, config, reconnect):
     if not config or config[0] != device:
         return None
     _, profile, driver, unit = config
-    connection_type = '802-11-wireless' if kind == 'Wi-Fi' else '802-3-ethernet'
     if ((reconnect == profile or not reconnect and driver_recovery_allowed(device, kind, driver))
-            and run('nmcli', '-g', 'connection.type', 'connection', 'show', 'uuid', profile)
-                == (0, connection_type)
-            and run('/usr/bin/systemctl', 'show', '-p', 'LoadState', '--value', unit) == (0, 'loaded')):
+            and profile_matches_kind(profile, kind) and recovery_unit_loaded(unit)):
         return profile, driver, unit
     return None
 
@@ -474,8 +512,10 @@ def main():
     mode.add_argument('--list-adapters', action='store_true', help='list managed Wi-Fi and Ethernet adapters')
     mode.add_argument('--repair', action='store_true', help='repair the selected adapter after confirmation')
     mode.add_argument('--sign-in', action='store_true', help='open sign-in if needed on the selected adapter')
+    mode.add_argument('--configure-recovery', metavar='UNIT', help='save an installed driver recovery service')
     parser.add_argument('--yes', action='store_true', help='confirm --repair without prompting')
     parser.add_argument('--device', help='adapter to check')
+    parser.add_argument('--profile', metavar='UUID', help='saved NetworkManager profile for --configure-recovery')
     parser.add_argument('--ping-target', type=parse_ping_target, help='override the public ping targets')
     report_mode = parser.add_mutually_exclusive_group()
     report_mode.add_argument('--report', action='store_true', help='print the private report')
@@ -483,6 +523,19 @@ def main():
     args = parser.parse_args()
     if args.yes and not args.repair:
         parser.error('--yes requires --repair')
+    if args.configure_recovery is not None:
+        if not args.device or not args.profile:
+            parser.error('--configure-recovery requires --device and --profile')
+        if args.ping_target or args.report or args.redacted_report:
+            parser.error('--configure-recovery does not run diagnostics or generate a report')
+        try:
+            path = configure_recovery(args.device, args.profile, args.configure_recovery)
+        except (ValueError, OSError) as error:
+            parser.exit(1, f'{error}\n')
+        print(f'Saved driver recovery settings to {path}.')
+        return 0
+    if args.profile is not None:
+        parser.error('--profile requires --configure-recovery')
     ping_target = args.ping_target
 
     def activity(message, operation):
