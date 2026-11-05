@@ -89,12 +89,19 @@ def diagnose(device, kind):
             reconnect = saved[0]
 
     if kind == 'Ethernet':
-        if data.get('WIRED-PROPERTIES.CARRIER') != 'on':
+        carrier = data.get('WIRED-PROPERTIES.CARRIER')
+        if carrier == 'off':
             rows['Link'] = ('No cable link', 'Check the Ethernet cable, dock, or switch.')
             return 'Ethernet link is down', rows, '', portal
+        if carrier != 'on':
+            rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.')
+            return 'Ethernet link unverified', rows, reconnect, portal
         rows['Link'] = ('Up', 'The adapter detects an Ethernet link.')
     elif state not in ('70', '80', '90', '100'):
-        rows['Link'] = ('Disconnected', 'Choose a network in the Wi-Fi menu or reconnect the saved profile.')
+        hint = 'Choose a network in the Wi-Fi menu.'
+        if reconnect:
+            hint += ' You can also reconnect the saved profile.'
+        rows['Link'] = ('Disconnected', hint)
         return 'Wi-Fi is disconnected', rows, reconnect, portal
     else:
         rows['Link'] = ('Joined', data.get('GENERAL.CONNECTION') or 'Joined a Wi-Fi network.')
@@ -111,6 +118,8 @@ def diagnose(device, kind):
     rows['Route'] = (('Found', ', '.join(f'IPv{family}' for family in routed)) if routed
                      else ('Missing', 'No route to the test destinations on this adapter.'))
     if not routed:
+        for step in ('DNS', 'Sign-in', 'Internet'):
+            rows[step] = ('Skipped', 'Requires a route on this adapter.')
         return 'The adapter has no route to the internet', rows, reconnect, portal
 
     run('nmcli', '-w', '4', 'networking', 'connectivity', 'check')
