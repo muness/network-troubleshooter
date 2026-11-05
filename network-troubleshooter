@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 TITLE = 'Network Troubleshooter'
 NM = 'org.freedesktop.NetworkManager'
 TEST_HOST = 'archlinux.org'
+DEFAULT_TARGETS = {4: '1.1.1.1', 6: '2606:4700:4700::1111'}
 FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
           'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,'
           'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY,CONNECTIONS.AVAILABLE-CONNECTIONS')
@@ -24,7 +25,7 @@ def run(*args, timeout=5):
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=ENV)
         return result.returncode, (result.stdout or result.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as error:
-        return 1, str(error)
+        return 2, str(error)
 
 
 def adapters():
@@ -67,9 +68,47 @@ def addresses(fields):
     return families
 
 
-def diagnose(device, kind):
+def ping_check(device, targets):
+    if not targets:
+        return 'Skipped', 'No route to the default ping targets on this adapter.'
+    statuses = {0: 'Replied', 1: 'No reply'}
+    results = []
+    for target in targets:
+        family = ipaddress.ip_address(target).version
+        code, _ = run('ping', f'-{family}', '-n', '-I', device, '-c', '1', '-w', '2',
+                      target, timeout=3)
+        results.append(statuses.get(code, 'Unavailable'))
+    status = results[0] if len(set(results)) == 1 else 'Mixed'
+    details = ' · '.join(f'{target} ({result.lower()})' for target, result in zip(targets, results))
+    return status, details
+
+
+def edit_ping_target(current):
+    result = desktop('--entry', '--no-markup', '--width=450',
+                     '--text=Enter an IPv4 or IPv6 address to ping through the selected adapter.',
+                     '--entry-label=IP address', f'--entry-text={current or ""}',
+                     '--button=Cancel:1', '--button=Use defaults:2', '--button=Apply:0')
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        return current
+    value = result.stdout.strip()
+    if not value:
+        return None
+    try:
+        if '%' in value:
+            raise ValueError
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        desktop('--error', '--no-markup',
+                '--text=Enter an IP address such as 192.168.1.1 or fe80::1.',
+                '--button=Close:0')
+        return current
+
+
+def diagnose(device, kind, ping_target=None):
     rows = {step: ('Skipped', 'Requires an active link with an IP address.')
-            for step in ('Link', 'IP address', 'Route', 'DNS', 'Sign-in', 'Internet')}
+            for step in ('Link', 'IP address', 'Route', 'Ping', 'DNS', 'Sign-in', 'Internet')}
     reconnect = portal = ''
     code, output = run('nmcli', '-t', '-e', 'no', '-f', FIELDS, 'device', 'show', device)
     if code:
@@ -108,15 +147,18 @@ def diagnose(device, kind):
 
     families = addresses(fields)
     if not families:
+        if ping_target:
+            rows['Ping'] = ping_check(device, [ping_target])
         rows['IP address'] = ('Missing', 'No address beyond link-local. Check DHCP or the saved IP settings.')
         return 'The adapter has no usable IP address', rows, reconnect, portal
     rows['IP address'] = ('Assigned', ', '.join(f'IPv{family}' for family in sorted(families)))
 
-    targets = {4: '1.1.1.1', 6: '2606:4700:4700::1111'}
     routed = [family for family in sorted(families)
-              if run('ip', f'-{family}', 'route', 'get', targets[family], 'oif', device)[0] == 0]
+              if run('ip', f'-{family}', 'route', 'get', DEFAULT_TARGETS[family], 'oif', device)[0] == 0]
     rows['Route'] = (('Found', ', '.join(f'IPv{family}' for family in routed)) if routed
                      else ('Missing', 'No route to the test destinations on this adapter.'))
+    ping_targets = [ping_target] if ping_target else [DEFAULT_TARGETS[family] for family in routed]
+    rows['Ping'] = ping_check(device, ping_targets)
     if not routed:
         for step in ('DNS', 'Sign-in', 'Internet'):
             rows[step] = ('Skipped', 'Requires a route on this adapter.')
@@ -183,7 +225,8 @@ def portal_url():
 
 def show(device, kind, result):
     headline, rows, reconnect, portal = result
-    buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=Check again:11']
+    buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=Ping target:14',
+               '--button=Check again:11']
     if reconnect:
         buttons += ['--button=Reconnect:12']
     if portal:
@@ -213,6 +256,7 @@ def main():
     parser.add_argument('--device', help='adapter to check')
     args = parser.parse_args()
     device = args.device
+    ping_target = None
     while True:
         devices, error = adapters()
         if not devices or (device and device not in {row[0] for row in devices}):
@@ -233,7 +277,7 @@ def main():
             if not device:
                 return 0
         kind = next(row[1] for row in devices if row[0] == device)
-        result = (working('Checking this adapter…', lambda: diagnose(device, kind)) if args.gui
+        result = (working('Checking this adapter…', lambda: diagnose(device, kind, ping_target)) if args.gui
                   else diagnose(device, kind))
         if not args.gui:
             headline, rows, _, _ = result
@@ -244,6 +288,8 @@ def main():
         action = show(device, kind, result)
         if action == 10:
             device = None
+        elif action == 14:
+            ping_target = edit_ping_target(ping_target)
         elif action == 12:
             confirmed = desktop('--question', '--no-markup',
                                 f'--text=Reconnect {device}? This can briefly interrupt this connection.',
