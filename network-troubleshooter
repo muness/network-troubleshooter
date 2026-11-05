@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Diagnose a NetworkManager connection from the desktop or terminal."""
 import argparse
+from datetime import datetime
+import fcntl
 import ipaddress
 import json
 import os
@@ -8,18 +10,21 @@ import re
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import tempfile
 from html import escape, unescape
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 TITLE = 'Network Troubleshooter'
 NM = 'org.freedesktop.NetworkManager'
 TEST_HOST = 'archlinux.org'
 DEFAULT_TARGETS = {4: '1.1.1.1', 6: '2606:4700:4700::1111'}
 FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
-          'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,'
+          'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,IP4.GATEWAY,IP6.GATEWAY,'
           'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY,CONNECTIONS.AVAILABLE-CONNECTIONS')
 ENV = {**os.environ, 'LC_ALL': 'C'}
-RECOVERY_CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter/recovery.json'
+CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter'
+STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
 
 
 def run(*args, timeout=5):
@@ -87,6 +92,12 @@ def ping_check(device, targets):
     return status, details
 
 
+def parse_ping_target(value):
+    if '%' in value:
+        raise ValueError('Use an unscoped IP address. The selected adapter sets the scope.')
+    return str(ipaddress.ip_address(value))
+
+
 def edit_ping_target(current):
     result = desktop('--entry', '--no-markup', '--width=450',
                      '--text=Enter an IPv4 or IPv6 address to ping through the selected adapter.',
@@ -100,9 +111,7 @@ def edit_ping_target(current):
     if not value:
         return None
     try:
-        if '%' in value:
-            raise ValueError
-        return str(ipaddress.ip_address(value))
+        return parse_ping_target(value)
     except ValueError:
         desktop('--error', '--no-markup',
                 '--text=Enter an IP address such as 192.168.1.1 or fe80::1.',
@@ -110,11 +119,42 @@ def edit_ping_target(current):
         return current
 
 
-def diagnose(device, kind, ping_target=None):
+def wifi_details(device, profile, details):
+    _, radio = run('nmcli', '-g', 'WIFI', 'radio')
+    link_code, link = run('iw', 'dev', device, 'link')
+    details.extend([f'Wi-Fi radio: {radio}', f'Wi-Fi link:\n{link}'])
+    if profile:
+        code, ssid = run('nmcli', '-e', 'no', '-g', '802-11-wireless.ssid',
+                         'connection', 'show', 'uuid', profile)
+        if code == 0 and ssid and ssid != '--':
+            code, scan = run('nmcli', '-t', '-e', 'no', '-f', 'SSID,CHAN,SIGNAL',
+                             'device', 'wifi', 'list', 'ifname', device, '--rescan', 'no')
+            matches = [line for line in scan.splitlines() if line.rsplit(':', 2)[0] == ssid]
+            visibility = ', '.join(matches) if matches else 'no match in cache'
+            details.extend([f'Saved SSID: {ssid}',
+                            f'Saved network (SSID:channel:signal): {visibility if code == 0 else scan}'])
+    return radio, link if link_code == 0 else ''
+
+
+def gateway_check(device, data):
+    gateways = []
+    for family in (4, 6):
+        try:
+            gateways.append(parse_ping_target(data.get(f'IP{family}.GATEWAY', '')))
+        except ValueError:
+            pass
+    if not gateways:
+        return 'Skipped', 'No gateway address was reported for this adapter.'
+    return ping_check(device, gateways)
+
+
+def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
+    details = details if details is not None else []
     rows = {step: ('Skipped', 'Requires an active link with an IP address.')
-            for step in ('Link', 'IP address', 'Route', 'Ping', 'DNS', 'Sign-in', 'Internet')}
+            for step in ('Link', 'IP address', 'Route', 'Gateway', 'Ping', 'DNS', 'Sign-in', 'Internet')}
     reconnect = portal = ''
     code, output = run('nmcli', '-t', '-e', 'no', '-f', FIELDS, 'device', 'show', device)
+    details.append(f'NetworkManager device snapshot:\n{output}')
     if code:
         rows['Link'] = ('Unavailable', output)
         return 'Couldn’t read adapter state', rows, reconnect, portal
@@ -140,15 +180,20 @@ def diagnose(device, kind, ping_target=None):
             rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.')
             return 'Ethernet link unverified', rows, reconnect, portal
         rows['Link'] = ('Up', 'The adapter detects an Ethernet link.')
-    elif state not in ('70', '80', '90', '100'):
-        hint = 'Choose a network in the Wi-Fi menu.'
-        if reconnect:
-            hint += ' You can also reconnect the saved profile.'
-        rows['Link'] = ('Disconnected', hint)
-        return 'Wi-Fi is disconnected', rows, reconnect, portal
     else:
+        radio, link = wifi_details(device, reconnect or profile_hint, details)
+        if radio == 'disabled':
+            rows['Link'] = ('Off', 'Turn Wi-Fi on from the network menu.')
+            return 'Wi-Fi is off', rows, '', portal
+        if link == 'Not connected.' or not link and state not in ('70', '80', '90', '100'):
+            hint = 'Choose a network in the Wi-Fi menu.'
+            if reconnect:
+                hint += ' You can also reconnect the saved profile.'
+            rows['Link'] = ('Disconnected', hint)
+            return 'Wi-Fi is disconnected', rows, reconnect, portal
         rows['Link'] = ('Joined', data.get('GENERAL.CONNECTION') or 'Joined a Wi-Fi network.')
 
+    rows['Gateway'] = gateway_check(device, data)
     families = addresses(fields)
     if not families:
         if ping_target:
@@ -163,27 +208,31 @@ def diagnose(device, kind, ping_target=None):
                      else ('Missing', 'No route to the test destinations on this adapter.'))
     ping_targets = [ping_target] if ping_target else [DEFAULT_TARGETS[family] for family in routed]
     rows['Ping'] = ping_check(device, ping_targets)
-    if not routed:
-        for step in ('DNS', 'Sign-in', 'Internet'):
-            rows[step] = ('Skipped', 'Requires a route on this adapter.')
-        return 'The adapter has no route to the internet', rows, reconnect, portal
-
     run('nmcli', '-w', '4', 'networking', 'connectivity', 'check')
     code, connectivity = run('nmcli', '-g', 'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY',
                              'device', 'show', device)
     states = {line.partition(' ')[0] for line in connectivity.splitlines()} if code == 0 else set()
+    details.append(f'NetworkManager adapter connectivity:\n{connectivity}')
     if '2' in states:
         rows['Sign-in'] = ('Required', 'NetworkManager detected a captive portal on this adapter.')
         portal = portal_url()
     else:
         rows['Sign-in'] = (('Not detected', 'NetworkManager did not report a sign-in page.')
                            if '4' in states else ('Unverified', 'No confirmed portal or full connectivity.'))
+    if not routed:
+        for step in ('DNS', 'Internet'):
+            rows[step] = ('Skipped', 'Requires a route on this adapter.')
+        if state == '100' and '4' not in states and not portal:
+            portal = portal_url()
+        headline = 'Sign in to use this network' if '2' in states else 'The adapter has no route to the internet'
+        return headline, rows, reconnect, portal
 
     resolved = []
     for family in routed:
         record_type = 'A' if family == 4 else 'AAAA'
         code, output = run('resolvectl', '-i', device, '--cache=no',
                            f'--type={record_type}', 'query', TEST_HOST)
+        details.append(f'Per-adapter DNS ({record_type}, exit {code}):\n{output}')
         for line in output.splitlines() if code == 0 else ():
             value, sep, link = line.partition('-- link:')
             if sep and link.strip() == device:
@@ -205,11 +254,15 @@ def diagnose(device, kind, ping_target=None):
         host_addresses = ','.join(str(a) if a.version == 4 else f'[{a}]' for a in resolved)
         curl += ['--resolve', f'{TEST_HOST}:443:{host_addresses}']
     code, status = run(*curl, f'https://{TEST_HOST}/', timeout=6)
+    details.append(f'Adapter-bound HTTPS (exit {code}):\n{status}')
     online = code == 0 and status == '200'
     rows['Internet'] = (('Reached', f'HTTPS worked through {device}.') if online else
                         ('Unverified', f'{TEST_HOST} did not return the expected HTTPS response.'))
     headline = ('Sign in to use this network' if '2' in states else
                 'Internet access verified' if online else 'Internet access unverified')
+    if not online and '4' not in states and not portal and state == '100':
+        portal = portal_url()
+        rows['Sign-in'] = ('Unverified', 'Try sign-in if this network uses a login page.')
     return headline, rows, reconnect, portal
 
 
@@ -224,12 +277,36 @@ def portal_url():
                 return url
         except (ValueError, TypeError, KeyError, AttributeError):
             pass
-    return ''
+    return 'http://nmcheck.gnome.org/check_network_status.txt'
+
+
+def launch_portal(device, kind, url):
+    path = CONFIG_DIR / 'portal.json'
+    if path.exists():
+        try:
+            config = json.loads(path.read_text(encoding='utf-8'))
+            command = config.get('wifi' if kind == 'Wi-Fi' else 'ethernet')
+        except (OSError, ValueError, AttributeError) as error:
+            return 2, f'Could not read portal helper settings: {error}'
+        if command is not None:
+            if (not isinstance(command, list) or not command
+                    or not all(isinstance(arg, str) and arg for arg in command)
+                    or not Path(command[0]).is_absolute()):
+                return 2, 'Portal helper must be an argument list starting with an absolute executable path.'
+            return run(*command, device, url, timeout=15)
+
+    helper = shutil.which('omarchy-network-captive-portal')
+    try:
+        subprocess.Popen([helper or 'xdg-open', url], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        return 2, str(error)
+    return 0, 'Opened the system sign-in helper.'
 
 
 def recovery_settings():
     try:
-        config = json.loads(RECOVERY_CONFIG.read_text(encoding='utf-8'))
+        config = json.loads((CONFIG_DIR / 'recovery.json').read_text(encoding='utf-8'))
         device, profile, driver, unit = (config[key] for key in ('adapter', 'profile', 'driver', 'unit'))
         if (re.fullmatch(r'[a-fA-F0-9-]{36}', profile)
                 and re.fullmatch(r'[A-Za-z0-9_-]+', driver)
@@ -273,8 +350,24 @@ def reconnect_profile(device, profile):
                timeout=28)
 
 
-def repair_connection(device, kind, profile, recovery=None):
-    code, output = working('Reconnecting this adapter…', lambda: reconnect_profile(device, profile))
+def repair_connection(device, kind, profile, recovery, activity, steps):
+    locks = STATE_DIR / 'locks'
+    locks.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (locks / f'{quote(device, safe="")}.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 1, 'Another repair is already running for this adapter.'
+        return repair_locked(device, kind, profile, recovery, activity, steps)
+
+
+def repair_locked(device, kind, profile, recovery, activity, steps):
+    def attempt(label, operation):
+        code, output = activity(label, operation)
+        steps.append((label, code, output))
+        return code, output
+
+    code, output = attempt('Reconnect saved profile', lambda: reconnect_profile(device, profile))
     if code == 0:
         return code, output
 
@@ -284,7 +377,7 @@ def repair_connection(device, kind, profile, recovery=None):
 
     if recovery and driver_recovery_allowed(device, kind, recovery[1]):
         _, driver, unit = recovery
-        code, output = working('Restarting the adapter. Approve authentication if prompted.',
+        code, output = attempt('Restart adapter via recovery service. Approve authentication if prompted.',
                                lambda: run('/usr/bin/pkexec', '/usr/bin/systemctl', '--wait', 'start',
                                            unit, timeout=150))
         if code in (126, 127):
@@ -295,27 +388,66 @@ def repair_connection(device, kind, profile, recovery=None):
             if run('nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', device) == (0, profile):
                 return 0, ''
             return 1, output or 'The adapter state changed during driver recovery.'
-        return working('Reconnecting after driver recovery…',
+        return attempt('Reconnect after driver recovery',
                        lambda: reconnect_profile(device, profile))
 
-    def reset():
-        if current[1] == profile:
-            code, output = run('nmcli', '-w', '8', 'device', 'disconnect', device, timeout=10)
-            if code:
-                return code, output
-        return reconnect_profile(device, profile)
+    if current[1] == profile:
+        code, output = attempt('Disconnect selected adapter',
+                               lambda: run('nmcli', '-w', '8', 'device', 'disconnect', device, timeout=10))
+        if code:
+            return code, output
+    return attempt('Retry saved profile', lambda: reconnect_profile(device, profile))
 
-    return working('Retrying the NetworkManager connection…', reset)
+
+def report_text(device, kind, result, details, recovery):
+    headline, rows, _, _ = result
+    timestamp = datetime.now().astimezone().isoformat(timespec='seconds')
+    checks = '\n'.join(f'{step} — {status}. {note}' for step, (status, note) in rows.items())
+    _, logs = run('journalctl', '-b', '--since=-15min', '-n', '35', '--no-pager',
+                  '-u', 'NetworkManager', '-u', 'wpa_supplicant', '-u', 'iwd',
+                  '--grep', rf'\b{re.escape(device)}\b')
+    sections = [f'{TITLE}\n{timestamp}\n{kind} · {device}\n{headline}', checks, *details,
+                f'Recent adapter logs (last 15 minutes):\n{logs}']
+    if recovery:
+        _, logs = run('journalctl', '-b', '--since=-15min', '-n', '20', '--no-pager',
+                      '-u', recovery[-1])
+        sections.append(f'Recent driver recovery logs (last 15 minutes):\n{logs}')
+    return '\n\n'.join(sections)
+
+
+def redacted_report(kind, result, steps, before=None):
+    # Build from statuses instead of trying to redact arbitrary journal output.
+    def checks(snapshot):
+        return '\n'.join(f'{step} — {status}' for step, (status, _) in snapshot[1].items())
+
+    text = f'{TITLE} — redacted report\nAdapter type: {kind}\n\n'
+    if before:
+        text += f'Before repair\n{checks(before)}\n\n'
+    if steps:
+        text += '\n'.join(f'{label} — exit {code}' for label, code, _ in steps) + '\n\n'
+    return text + ('After repair\n' if before else '') + checks(result)
+
+
+def view_report(path, redacted):
+    action = desktop('--text-info', '--no-markup', '--wrap', '--width=760', '--height=490',
+                     f'--text=Private report saved to {path}', f'--filename={path}',
+                     '--button=Back:0', '--button=Copy redacted:17')
+    if action.returncode == 17:
+        try:
+            subprocess.run(['wl-copy'], input=redacted, text=True, check=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as error:
+            desktop('--error', '--no-markup', f'--text=Could not copy report: {error}', '--button=Close:0')
 
 
 def show(device, kind, result, recovery):
     headline, rows, reconnect, portal = result
-    buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=Ping target:14',
+    buttons = ['--button=Close:0', '--button=View report:16', '--button=Choose adapter:10', '--button=Ping target:14',
                '--button=Check again:11']
     if reconnect or recovery:
         buttons += ['--button=Repair connection:12']
     if portal:
-        buttons += ['--button=Open sign-in:13']
+        label = 'Open sign-in' if rows['Sign-in'][0] == 'Required' else 'Try sign-in'
+        buttons += [f'--button={label}:13']
     cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
     return desktop('--list', '--width=720', '--height=320', '--text-width=75',
                    f'--text=<b>{escape(headline)}</b>\n{escape(kind)} · {escape(device)}',
@@ -337,12 +469,43 @@ def working(message, operation):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--gui', action='store_true', help='open the desktop interface')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--gui', action='store_true', help='open the desktop interface')
+    mode.add_argument('--list-adapters', action='store_true', help='list managed Wi-Fi and Ethernet adapters')
+    mode.add_argument('--repair', action='store_true', help='repair the selected adapter after confirmation')
+    mode.add_argument('--sign-in', action='store_true', help='open sign-in if needed on the selected adapter')
+    parser.add_argument('--yes', action='store_true', help='confirm --repair without prompting')
     parser.add_argument('--device', help='adapter to check')
+    parser.add_argument('--ping-target', type=parse_ping_target, help='override the public ping targets')
+    report_mode = parser.add_mutually_exclusive_group()
+    report_mode.add_argument('--report', action='store_true', help='print the private report')
+    report_mode.add_argument('--redacted-report', action='store_true', help='print a shareable report')
     args = parser.parse_args()
+    if args.yes and not args.repair:
+        parser.error('--yes requires --repair')
+    ping_target = args.ping_target
+
+    def activity(message, operation):
+        if args.gui:
+            return working(message, operation)
+        if args.repair:
+            print(message, file=sys.stderr)
+        return operation()
+
     device = args.device
-    ping_target = None
-    config = recovery_settings() if args.gui else None
+    config = recovery_settings()
+    path = before = None
+    history = ''
+    steps = []
+
+    def scan():
+        details = []
+        hint = config[1] if config and config[0] == device else None
+        result = activity('Checking this adapter…',
+                          lambda: diagnose(device, kind, ping_target, details, hint))
+        recovery = configured_recovery(device, kind, config, result[2])
+        return result, recovery, report_text(device, kind, result, details, config if hint else None)
+
     while True:
         devices, error = adapters()
         if not devices or (device and device not in {row[0] for row in devices}):
@@ -351,55 +514,114 @@ def main():
             if args.gui:
                 desktop('--info', '--no-markup', f'--text={message}', '--button=Close:0')
             else:
-                print(message)
+                print(message, file=sys.stderr)
             return 1
+        if args.list_adapters or not device and not args.gui and len(devices) > 1:
+            for row in devices:
+                print(*row, sep='\t')
+            if not args.list_adapters:
+                print('Run again with --device ADAPTER.', file=sys.stderr)
+            return int(not args.list_adapters and (args.repair or args.sign_in or args.report or args.redacted_report))
         if not device:
-            if not args.gui and len(devices) > 1:
-                for row in devices:
-                    print(*row, sep='\t')
-                print('Run again with --device ADAPTER.')
-                return 0
             device = choose(devices) if args.gui else devices[0][0]
             if not device:
                 return 0
         kind = next(row[1] for row in devices if row[0] == device)
-        result = (working('Checking this adapter…', lambda: diagnose(device, kind, ping_target)) if args.gui
-                  else diagnose(device, kind))
-        if not args.gui:
-            headline, rows, _, _ = result
-            print(f'{kind} · {device}\n{headline}')
-            for step, (state, detail) in rows.items():
-                print(f'{step} — {state}. {detail}')
-            return 0
-        recovery = configured_recovery(device, kind, config, result[2])
-        action = show(device, kind, result, recovery)
+
+        if path is None:
+            STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(prefix='network-', suffix='.txt', dir=STATE_DIR,
+                                             delete=False) as report:
+                path = Path(report.name)
+        result, recovery, private = scan()
+        path.write_text(('After repair\n' if before else '') + private + history + '\n',
+                        encoding='utf-8')
+        redacted = redacted_report(kind, result, steps, before)
+        action = show(device, kind, result, recovery) if args.gui else 12 if args.repair else 13 if args.sign_in else 0
+        while action == 16:
+            view_report(path, redacted)
+            action = show(device, kind, result, recovery)
+        code = 0
+
         if action == 10:
-            device = None
-        elif action == 14:
+            device = path = before = None
+            history = ''
+            steps = []
+            continue
+        if action == 14:
             ping_target = edit_ping_target(ping_target)
-        elif action == 12:
+            continue
+        if action == 11:
+            continue
+        if action == 12:
+            profile = recovery[0] if recovery else result[2]
             message = (f'Retry the saved profile on {device}? If it fails, the app will retry after '
                        'disconnecting that connection if it is active.')
             if recovery:
                 message += (' If the driver recovery service can run, it may restart the adapter '
                             'and ask for authentication.')
-            confirmed = desktop('--question', '--no-markup',
-                                f'--text={message}', '--button=Cancel:1',
-                                '--button=Repair connection:0')
-            if confirmed.returncode == 0:
-                profile = recovery[0] if recovery else result[2]
-                code, output = repair_connection(device, kind, profile, recovery)
-                if code:
-                    desktop('--error', '--no-markup', f'--text={output}', '--button=Close:0')
+            if not profile:
+                code, output = 1, 'No saved profile is available to repair on this adapter.'
+            elif args.gui:
+                confirmed = desktop('--question', '--no-markup',
+                                    f'--text={message}', '--button=Cancel:1',
+                                    '--button=Repair connection:0').returncode == 0
+            elif args.yes:
+                confirmed = True
+            elif sys.stdin.isatty():
+                print(f'{message} [y/N] ', end='', file=sys.stderr, flush=True)
+                confirmed = sys.stdin.readline().strip().lower() in ('y', 'yes')
+            else:
+                parser.error('--repair requires --yes when stdin is not a terminal')
+
+            if profile and confirmed:
+                before = result
+                steps = []
+                code, output = repair_connection(device, kind, profile, recovery, activity, steps)
+                steps.append(('Repair result', code, output))
+                attempts = '\n\n'.join(f'{label} (exit {status})\n{detail}'
+                                         for label, status, detail in steps)
+                history = f'\n\nRepair attempts\n{attempts}\n\nBefore repair\n{private}{history}'
+                path.write_text(history.lstrip() + '\n', encoding='utf-8')
+                if not args.gui:
+                    result, recovery, private = scan()
+                    private = f'After repair\n{private}{history}\n'
+                    path.write_text(private, encoding='utf-8')
+                    redacted = redacted_report(kind, result, steps, before)
+            elif profile:
+                if args.gui:
+                    continue
+                code, output = 1, 'Repair cancelled.'
         elif action == 13:
-            helper = shutil.which('omarchy-network-captive-portal')
-            try:
-                subprocess.Popen([helper or 'xdg-open', result[3]], start_new_session=True)
-                return 0
-            except OSError as error:
-                desktop('--error', '--no-markup', f'--text={error}', '--button=Close:0')
-        elif action != 11:
+            if result[3]:
+                code, output = launch_portal(device, kind, result[3])
+                steps.append(('Open sign-in', code, output))
+                history = f'\n\nSign-in handoff (exit {code}):\n{output}{history}'
+                path.write_text(private + history + '\n', encoding='utf-8')
+                redacted = redacted_report(kind, result, steps, before)
+            else:
+                code, output = 1, 'This check did not find a sign-in page to open.'
+
+        if code:
+            if args.gui:
+                desktop('--error', '--no-markup', f'--text={output}', '--button=Close:0')
+            else:
+                print(output, file=sys.stderr)
+        if args.gui:
+            if action == 12 or code:
+                continue
             return 0
+        if args.report:
+            print(path.read_text(encoding='utf-8').rstrip())
+        elif args.redacted_report:
+            print(redacted)
+        else:
+            headline, rows, _, _ = result
+            print(f'{kind} · {device}\n{headline}')
+            for step, (status, detail) in rows.items():
+                print(f'{step} — {status}. {detail}')
+        print(f'Private report saved to {path}', file=sys.stderr)
+        return int(bool(code))
 
 
 if __name__ == '__main__':
