@@ -1,0 +1,260 @@
+#!/usr/bin/python3
+"""Diagnose a NetworkManager connection from the desktop or terminal."""
+import argparse
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+from html import escape, unescape
+from urllib.parse import urlsplit
+
+TITLE = 'Network Troubleshooter'
+NM = 'org.freedesktop.NetworkManager'
+TEST_HOST = 'archlinux.org'
+FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
+          'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,'
+          'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY,CONNECTIONS.AVAILABLE-CONNECTIONS')
+ENV = {**os.environ, 'LC_ALL': 'C'}
+
+
+def run(*args, timeout=5):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=ENV)
+        return result.returncode, (result.stdout or result.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, str(error)
+
+
+def adapters():
+    code, text = run('nmcli', '-t', '-e', 'no', '-f', 'DEVICE,TYPE,STATE', 'device', 'status')
+    if code:
+        return [], text
+    devices = []
+    for line in text.splitlines():
+        device, kind, state = line.split(':', 2)
+        if kind in ('ethernet', 'wifi') and state != 'unmanaged':
+            devices.append((device, 'Ethernet' if kind == 'ethernet' else 'Wi-Fi', state))
+    return devices, ''
+
+
+def desktop(*args):
+    return subprocess.run(['yad', '--center', '--fixed', '--borders=14',
+                           f'--title={TITLE}', *args], capture_output=True, text=True)
+
+
+def choose(devices):
+    if len(devices) == 1:
+        return devices[0][0]
+    result = desktop('--list', '--width=560', '--height=260', '--text=Which adapter should we check?',
+                     '--column=Adapter', '--column=Type', '--column=State',
+                     '--print-column=1', '--separator=|', '--button=Close:1',
+                     '--button=Check adapter:0', '--', *(escape(field) for row in devices for field in row))
+    return unescape(result.stdout.strip().removesuffix('|')) if result.returncode == 0 else ''
+
+
+def addresses(fields):
+    families = set()
+    for key, value in fields:
+        if key.startswith(('IP4.ADDRESS[', 'IP6.ADDRESS[')):
+            try:
+                address = ipaddress.ip_interface(value).ip
+                if not (address.is_link_local or address.is_unspecified):
+                    families.add(address.version)
+            except ValueError:
+                continue
+    return families
+
+
+def diagnose(device, kind):
+    rows = {step: ('Skipped', 'Requires an active link with an IP address.')
+            for step in ('Link', 'IP address', 'Route', 'DNS', 'Sign-in', 'Internet')}
+    reconnect = portal = ''
+    code, output = run('nmcli', '-t', '-e', 'no', '-f', FIELDS, 'device', 'show', device)
+    if code:
+        rows['Link'] = ('Unavailable', output)
+        return 'Couldn’t read adapter state', rows, reconnect, portal
+
+    fields = [line.split(':', 1) for line in output.splitlines() if ':' in line]
+    data = dict(fields)
+    state = data.get('GENERAL.STATE', '').partition(' ')[0]
+    profile = data.get('GENERAL.CON-UUID', '')
+    if profile and profile != '--':
+        reconnect = profile
+    elif kind == 'Ethernet' and data.get('WIRED-PROPERTIES.CARRIER') == 'on':
+        saved = [value.split(' | ', 1)[0] for key, value in fields
+                 if key.startswith('CONNECTIONS.AVAILABLE-CONNECTIONS[')]
+        if len(saved) == 1:
+            reconnect = saved[0]
+
+    if kind == 'Ethernet':
+        if data.get('WIRED-PROPERTIES.CARRIER') != 'on':
+            rows['Link'] = ('No cable link', 'Check the Ethernet cable, dock, or switch.')
+            return 'Ethernet link is down', rows, '', portal
+        rows['Link'] = ('Up', 'The adapter detects an Ethernet link.')
+    elif state not in ('70', '80', '90', '100'):
+        rows['Link'] = ('Disconnected', 'Choose a network in the Wi-Fi menu or reconnect the saved profile.')
+        return 'Wi-Fi is disconnected', rows, reconnect, portal
+    else:
+        rows['Link'] = ('Joined', data.get('GENERAL.CONNECTION') or 'Joined a Wi-Fi network.')
+
+    families = addresses(fields)
+    if not families:
+        rows['IP address'] = ('Missing', 'No address beyond link-local. Check DHCP or the saved IP settings.')
+        return 'The adapter has no usable IP address', rows, reconnect, portal
+    rows['IP address'] = ('Assigned', ', '.join(f'IPv{family}' for family in sorted(families)))
+
+    targets = {4: '1.1.1.1', 6: '2606:4700:4700::1111'}
+    routed = [family for family in sorted(families)
+              if run('ip', f'-{family}', 'route', 'get', targets[family], 'oif', device)[0] == 0]
+    rows['Route'] = (('Found', ', '.join(f'IPv{family}' for family in routed)) if routed
+                     else ('Missing', 'No route to the test destinations on this adapter.'))
+    if not routed:
+        return 'The adapter has no route to the internet', rows, reconnect, portal
+
+    run('nmcli', '-w', '4', 'networking', 'connectivity', 'check')
+    code, connectivity = run('nmcli', '-g', 'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY',
+                             'device', 'show', device)
+    states = {line.partition(' ')[0] for line in connectivity.splitlines()} if code == 0 else set()
+    if '2' in states:
+        rows['Sign-in'] = ('Required', 'NetworkManager detected a captive portal on this adapter.')
+        portal = portal_url()
+    else:
+        rows['Sign-in'] = (('Not detected', 'NetworkManager did not report a sign-in page.')
+                           if '4' in states else ('Unverified', 'No confirmed portal or full connectivity.'))
+
+    resolved = []
+    for family in routed:
+        record_type = 'A' if family == 4 else 'AAAA'
+        code, output = run('resolvectl', '-i', device, '--cache=no',
+                           f'--type={record_type}', 'query', TEST_HOST)
+        for line in output.splitlines() if code == 0 else ():
+            value, sep, link = line.partition('-- link:')
+            if sep and link.strip() == device:
+                try:
+                    address = ipaddress.ip_address(value.split()[-1])
+                except (ValueError, IndexError):
+                    continue
+                if address.version == family:
+                    resolved.append(address)
+                    break
+    rows['DNS'] = (('Resolved', 'The test site resolved on this adapter.') if resolved else
+                   ('Unverified', 'No per-adapter DNS answer. This check needs systemd-resolved.'))
+
+    # Supply the address returned by this adapter's resolver. With no such
+    # answer, curl may use system DNS, but the HTTPS socket stays bound.
+    curl = ['curl', '-q', '--noproxy', '*', '--interface', f'if!{device}', '--max-time', '5',
+            '-sS', '-o', '/dev/null', '-w', '%{http_code}']
+    if resolved:
+        host_addresses = ','.join(str(a) if a.version == 4 else f'[{a}]' for a in resolved)
+        curl += ['--resolve', f'{TEST_HOST}:443:{host_addresses}']
+    code, status = run(*curl, f'https://{TEST_HOST}/', timeout=6)
+    online = code == 0 and status == '200'
+    rows['Internet'] = (('Reached', f'HTTPS worked through {device}.') if online else
+                        ('Unverified', f'{TEST_HOST} did not return the expected HTTPS response.'))
+    headline = ('Sign in to use this network' if '2' in states else
+                'Internet access verified' if online else 'Internet access unverified')
+    return headline, rows, reconnect, portal
+
+
+def portal_url():
+    code, output = run('busctl', '--system', '--json=short', 'get-property', NM,
+                       '/org/freedesktop/NetworkManager', NM, 'ConnectivityCheckUri')
+    if code == 0:
+        try:
+            url = json.loads(output)['data']
+            parsed = urlsplit(url)
+            if parsed.scheme == 'http' and parsed.hostname:
+                return url
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+    return ''
+
+
+def show(device, kind, result):
+    headline, rows, reconnect, portal = result
+    buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=Check again:11']
+    if reconnect:
+        buttons += ['--button=Reconnect:12']
+    if portal:
+        buttons += ['--button=Open sign-in:13']
+    cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
+    return desktop('--list', '--width=720', '--height=320', '--text-width=75',
+                   f'--text=<b>{escape(headline)}</b>\n{escape(kind)} · {escape(device)}',
+                   '--text-align=left', '--response=0', '--no-selection', '--grid-lines=horizontal',
+                   '--column=Check', '--column=Result', '--column=Details',
+                   '--expand-column=3', '--wrap-cols=3', '--wrap-width=395',
+                   *buttons, '--', *cells).returncode
+
+
+def working(message, operation):
+    with subprocess.Popen(['yad', '--progress', '--continuous', '--hide-text', '--no-buttons',
+                           '--fixed', '--center', '--width=420', f'--title={TITLE}',
+                           f'--text={message}'], stdin=subprocess.PIPE) as progress:
+        try:
+            return operation()
+        finally:
+            progress.terminate()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--gui', action='store_true', help='open the desktop interface')
+    parser.add_argument('--device', help='adapter to check')
+    args = parser.parse_args()
+    device = args.device
+    while True:
+        devices, error = adapters()
+        if not devices or (device and device not in {row[0] for row in devices}):
+            message = error or (f'Adapter {device} is unavailable.' if device else
+                                'No NetworkManager-managed Wi-Fi or Ethernet adapter was found.')
+            if args.gui:
+                desktop('--info', '--no-markup', f'--text={message}', '--button=Close:0')
+            else:
+                print(message)
+            return 1
+        if not device:
+            if not args.gui and len(devices) > 1:
+                for row in devices:
+                    print(*row, sep='\t')
+                print('Run again with --device ADAPTER.')
+                return 0
+            device = choose(devices) if args.gui else devices[0][0]
+            if not device:
+                return 0
+        kind = next(row[1] for row in devices if row[0] == device)
+        result = (working('Checking this adapter…', lambda: diagnose(device, kind)) if args.gui
+                  else diagnose(device, kind))
+        if not args.gui:
+            headline, rows, _, _ = result
+            print(f'{kind} · {device}\n{headline}')
+            for step, (state, detail) in rows.items():
+                print(f'{step} — {state}. {detail}')
+            return 0
+        action = show(device, kind, result)
+        if action == 10:
+            device = None
+        elif action == 12:
+            confirmed = desktop('--question', '--no-markup',
+                                f'--text=Reconnect {device}? This can briefly interrupt this connection.',
+                                '--button=Cancel:1', '--button=Reconnect:0')
+            if confirmed.returncode == 0:
+                code, output = working('Reconnecting this adapter…', lambda: run(
+                    'nmcli', '-w', '25', 'connection', 'up', 'uuid', result[2], 'ifname', device,
+                    timeout=28))
+                if code:
+                    desktop('--error', '--no-markup', f'--text={output}', '--button=Close:0')
+        elif action == 13:
+            helper = shutil.which('omarchy-network-captive-portal')
+            try:
+                subprocess.Popen([helper or 'xdg-open', result[3]], start_new_session=True)
+                return 0
+            except OSError as error:
+                desktop('--error', '--no-markup', f'--text={error}', '--button=Close:0')
+        elif action != 11:
+            return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
