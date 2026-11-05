@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,13 +19,16 @@ FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
           'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,'
           'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY,CONNECTIONS.AVAILABLE-CONNECTIONS')
 ENV = {**os.environ, 'LC_ALL': 'C'}
+RECOVERY_CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter/recovery.json'
 
 
 def run(*args, timeout=5):
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=ENV)
         return result.returncode, (result.stdout or result.stderr).strip()
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        return 124, str(error)
+    except OSError as error:
         return 2, str(error)
 
 
@@ -121,7 +125,7 @@ def diagnose(device, kind, ping_target=None):
     profile = data.get('GENERAL.CON-UUID', '')
     if profile and profile != '--':
         reconnect = profile
-    elif kind == 'Ethernet' and data.get('WIRED-PROPERTIES.CARRIER') == 'on':
+    elif kind == 'Wi-Fi' or data.get('WIRED-PROPERTIES.CARRIER') == 'on':
         saved = [value.split(' | ', 1)[0] for key, value in fields
                  if key.startswith('CONNECTIONS.AVAILABLE-CONNECTIONS[')]
         if len(saved) == 1:
@@ -223,12 +227,93 @@ def portal_url():
     return ''
 
 
-def show(device, kind, result):
+def recovery_settings():
+    try:
+        config = json.loads(RECOVERY_CONFIG.read_text(encoding='utf-8'))
+        device, profile, driver, unit = (config[key] for key in ('adapter', 'profile', 'driver', 'unit'))
+        if (re.fullmatch(r'[a-fA-F0-9-]{36}', profile)
+                and re.fullmatch(r'[A-Za-z0-9_-]+', driver)
+                and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service', unit)):
+            return device, profile, driver, unit
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def driver_recovery_allowed(device, kind, driver):
+    link = Path('/sys/class/net') / device / 'device/driver'
+    if not link.is_symlink() or link.resolve().name != driver:
+        return False
+    if run('nmcli', '-g', 'GENERAL.AUTOCONNECT', 'device', 'show', device) != (0, 'yes'):
+        return False
+    if kind == 'Ethernet':
+        return run('nmcli', '-g', 'GENERAL.STATE', 'device', 'show', device)[1].startswith('30 ')
+    code, output = run('nmcli', '-t', '-f', 'DEVICE,TYPE', 'device', 'status')
+    if code or [line for line in output.splitlines() if line.endswith(':wifi')] != [f'{device}:wifi']:
+        return False
+    return (run('iw', 'dev', device, 'link') == (0, 'Not connected.')
+            and run('nmcli', '-g', 'WIFI', 'radio') == (0, 'enabled'))
+
+
+def configured_recovery(device, kind, config, reconnect):
+    if not config or config[0] != device:
+        return None
+    _, profile, driver, unit = config
+    connection_type = '802-11-wireless' if kind == 'Wi-Fi' else '802-3-ethernet'
+    if ((reconnect == profile or not reconnect and driver_recovery_allowed(device, kind, driver))
+            and run('nmcli', '-g', 'connection.type', 'connection', 'show', 'uuid', profile)
+                == (0, connection_type)
+            and run('/usr/bin/systemctl', 'show', '-p', 'LoadState', '--value', unit) == (0, 'loaded')):
+        return profile, driver, unit
+    return None
+
+
+def reconnect_profile(device, profile):
+    return run('nmcli', '-w', '25', 'connection', 'up', 'uuid', profile, 'ifname', device,
+               timeout=28)
+
+
+def repair_connection(device, kind, profile, recovery=None):
+    code, output = working('Reconnecting this adapter…', lambda: reconnect_profile(device, profile))
+    if code == 0:
+        return code, output
+
+    current = run('nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', device)
+    if current[0] != 0 or current[1] not in ('', '--', profile):
+        return code, output
+
+    if recovery and driver_recovery_allowed(device, kind, recovery[1]):
+        _, driver, unit = recovery
+        code, output = working('Restarting the adapter. Approve authentication if prompted.',
+                               lambda: run('/usr/bin/pkexec', '/usr/bin/systemctl', '--wait', 'start',
+                                           unit, timeout=150))
+        if code in (126, 127):
+            return code, 'Authentication was cancelled or unavailable.'
+        if code == 124:
+            return code, 'The driver recovery service did not finish in time.'
+        if not driver_recovery_allowed(device, kind, driver):
+            if run('nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', device) == (0, profile):
+                return 0, ''
+            return 1, output or 'The adapter state changed during driver recovery.'
+        return working('Reconnecting after driver recovery…',
+                       lambda: reconnect_profile(device, profile))
+
+    def reset():
+        if current[1] == profile:
+            code, output = run('nmcli', '-w', '8', 'device', 'disconnect', device, timeout=10)
+            if code:
+                return code, output
+        return reconnect_profile(device, profile)
+
+    return working('Retrying the NetworkManager connection…', reset)
+
+
+def show(device, kind, result, recovery):
     headline, rows, reconnect, portal = result
     buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=Ping target:14',
                '--button=Check again:11']
-    if reconnect:
-        buttons += ['--button=Reconnect:12']
+    if reconnect or recovery:
+        buttons += ['--button=Repair connection:12']
     if portal:
         buttons += ['--button=Open sign-in:13']
     cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
@@ -257,6 +342,7 @@ def main():
     args = parser.parse_args()
     device = args.device
     ping_target = None
+    config = recovery_settings() if args.gui else None
     while True:
         devices, error = adapters()
         if not devices or (device and device not in {row[0] for row in devices}):
@@ -285,19 +371,24 @@ def main():
             for step, (state, detail) in rows.items():
                 print(f'{step} — {state}. {detail}')
             return 0
-        action = show(device, kind, result)
+        recovery = configured_recovery(device, kind, config, result[2])
+        action = show(device, kind, result, recovery)
         if action == 10:
             device = None
         elif action == 14:
             ping_target = edit_ping_target(ping_target)
         elif action == 12:
+            message = (f'Retry the saved profile on {device}? If it fails, the app will retry after '
+                       'disconnecting that connection if it is active.')
+            if recovery:
+                message += (' If the driver recovery service can run, it may restart the adapter '
+                            'and ask for authentication.')
             confirmed = desktop('--question', '--no-markup',
-                                f'--text=Reconnect {device}? This can briefly interrupt this connection.',
-                                '--button=Cancel:1', '--button=Reconnect:0')
+                                f'--text={message}', '--button=Cancel:1',
+                                '--button=Repair connection:0')
             if confirmed.returncode == 0:
-                code, output = working('Reconnecting this adapter…', lambda: run(
-                    'nmcli', '-w', '25', 'connection', 'up', 'uuid', result[2], 'ifname', device,
-                    timeout=28))
+                profile = recovery[0] if recovery else result[2]
+                code, output = repair_connection(device, kind, profile, recovery)
                 if code:
                     desktop('--error', '--no-markup', f'--text={output}', '--button=Close:0')
         elif action == 13:
