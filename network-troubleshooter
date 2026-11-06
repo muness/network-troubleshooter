@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from html import escape, unescape
 from urllib.parse import quote, urlsplit
 
@@ -26,6 +27,7 @@ ENV = {**os.environ, 'LC_ALL': 'C'}
 CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter'
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
 RECOVERY_UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service')
+USB_WAKE_HELPER = '/usr/local/libexec/network-troubleshooter-wake-dock-ethernet'
 
 
 def run(*args, timeout=5):
@@ -175,7 +177,9 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     if kind == 'Ethernet':
         carrier = data.get('WIRED-PROPERTIES.CARRIER')
         if carrier == 'off':
-            rows['Link'] = ('No cable link', 'Check the Ethernet cable, dock, or switch.')
+            hint = ('Use Repair connection to wake the dock’s Ethernet adapter.'
+                    if usb_wake_supported(device) else 'Check the Ethernet cable, dock, or switch.')
+            rows['Link'] = ('No cable link', hint)
             return 'Ethernet link is down', rows, '', portal
         if carrier != 'on':
             rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.')
@@ -405,7 +409,34 @@ def active_profile(device):
     return state, data['GENERAL.CON-UUID']
 
 
-def repair_connection(device, kind, profile, recovery, attempt):
+def usb_wake_supported(device):
+    return run(USB_WAKE_HELPER, '--check', device)[0] == 0
+
+
+def repair_usb_ethernet(device, attempt):
+    code, output = attempt('Wake dock USB Ethernet. Approve authentication if prompted.',
+                           lambda: run('/usr/bin/pkexec', '--disable-internal-agent',
+                                       USB_WAKE_HELPER, device, timeout=None))
+    if code in (126, 127):
+        return code, 'Authentication was cancelled or unavailable.'
+    if code:
+        return code, output
+
+    def wait_for_networkmanager():
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            state, _ = active_profile(device)
+            if state == '100':
+                return 0, 'NetworkManager activated the wired connection.'
+            if state is None:
+                return 1, 'The Ethernet adapter became unavailable.'
+            time.sleep(0.5)
+        return 1, 'The dock has an Ethernet link, but NetworkManager did not finish connecting.'
+
+    return attempt('Wait for NetworkManager to connect Ethernet', wait_for_networkmanager)
+
+
+def repair_connection(device, kind, profile, recovery, attempt, *, wake_usb=False):
     locks = STATE_DIR / 'locks'
     locks.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (locks / f'{quote(device, safe="")}.lock').open('a') as lock:
@@ -413,6 +444,8 @@ def repair_connection(device, kind, profile, recovery, attempt):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 1, 'Another repair is already running for this adapter.'
+        if wake_usb:
+            return repair_usb_ethernet(device, attempt)
         return repair_locked(device, kind, profile, recovery, attempt)
 
 
@@ -645,15 +678,19 @@ def main():
         if action == 12:
             profile = recovery[0] if recovery else result[2]
             link_status, link_detail = result[1]['Link']
-            blocked = link_status in ('Off', 'No cable link', 'Unavailable')
+            wake_usb = kind == 'Ethernet' and link_status == 'No cable link' and usb_wake_supported(device)
+            blocked = link_status in ('Off', 'No cable link', 'Unavailable') and not wake_usb
             message = (f'Retry the saved profile on {device}? If it fails, the app will retry after '
                        'disconnecting that connection if it is active.')
             if recovery:
                 message = (f'Retry the saved profile on {device}? If it fails, the app can restart '
                            'the adapter using the configured recovery service and may ask for authentication.')
+            if wake_usb:
+                message = ('Wake the dock’s Ethernet adapter and check the connection? '
+                           'You may be asked to authenticate.')
             if blocked:
                 code, output = 1, f'{result[0]}. {link_detail}'
-            elif not profile:
+            elif not profile and not wake_usb:
                 code, output = 1, ('No single saved profile could be selected. Choose the network '
                                    'from your network menu and check this adapter again.')
             elif args.gui:
@@ -688,7 +725,7 @@ def main():
                     path.write_text(save_attempts().lstrip() + '\n', encoding='utf-8')
                     return outcome
 
-                code, output = repair_connection(device, kind, profile, recovery, attempt)
+                code, output = repair_connection(device, kind, profile, recovery, attempt, wake_usb=wake_usb)
                 history = save_attempts('Checking this adapter again')
                 path.write_text(history.lstrip() + '\n', encoding='utf-8')
                 result, recovery, private = scan()
