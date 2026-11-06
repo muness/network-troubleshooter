@@ -1,0 +1,88 @@
+#!/usr/bin/python3 -I
+"""Temporarily resume a USB Ethernet device that has no link."""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import time
+
+NET = Path('/sys/class/net')
+USB = Path('/sys/bus/usb')
+
+
+def wake(interface, check):
+    if not interface or Path(interface).name != interface or interface in ('.', '..'):
+        raise ValueError('Enter a network interface name.')
+    net = (NET / interface).resolve(strict=True)
+    if ((net / 'type').read_text().strip() != '1'
+            or 'DEVTYPE=wlan' in (net / 'uevent').read_text().splitlines()
+            or (net / 'wireless').exists()):
+        raise ValueError('This interface is not Ethernet.')
+    usb_interface = (net / 'device').resolve(strict=True)
+    if ((usb_interface / 'subsystem').resolve() != USB
+            or 'DEVTYPE=usb_interface' not in (usb_interface / 'uevent').read_text().splitlines()):
+        raise ValueError('This Ethernet adapter is not connected over USB.')
+
+    # Keep the USB directory open so an unplug cannot redirect a write to
+    # a different device that later appears at the same USB address.
+    usb = os.open(usb_interface.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def open_usb(path, mode='r'):
+            return open(path, mode, encoding='ascii',
+                        opener=lambda name, flags: os.open(name, flags, dir_fd=usb))
+
+        if not check:
+            if os.geteuid() != 0:
+                raise ValueError('USB wake requires administrator authentication.')
+            try:
+                fcntl.flock(usb, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('USB wake is already running for this device.') from None
+
+        with (net / 'carrier').open(encoding='ascii') as carrier:
+            if carrier.read().strip() == '1':
+                if check:
+                    raise ValueError('Ethernet already has a link.')
+                return 'Ethernet already has a link.'
+            with open_usb('power/runtime_status') as status:
+                if status.read().strip() != 'suspended':
+                    raise ValueError('The USB adapter is already awake. Check the Ethernet cable or switch port.')
+            with open_usb('power/control', 'r' if check else 'r+') as control:
+                if control.read().strip() != 'auto':
+                    raise ValueError('The USB adapter is not set to autosuspend.')
+                if check:
+                    return 'USB wake is available for this Ethernet adapter.'
+
+                def set_power(value):
+                    control.seek(0)
+                    control.write(value + '\n')
+                    control.flush()
+
+                try:
+                    set_power('on')
+                    deadline = time.monotonic() + 12
+                    while time.monotonic() < deadline:
+                        carrier.seek(0)
+                        if carrier.read().strip() == '1':
+                            return 'Ethernet link detected after waking the USB adapter.'
+                        time.sleep(0.25)
+                    raise ValueError('Still no Ethernet link after waking the USB adapter. Check the cable or switch port.')
+                finally:
+                    set_power('auto')
+    finally:
+        os.close(usb)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('interface')
+    parser.add_argument('--check', action='store_true', help='check whether the adapter is eligible for wake')
+    args = parser.parse_args()
+    try:
+        print(wake(args.interface, args.check))
+    except (OSError, ValueError) as error:
+        parser.exit(1, f'{error}\n')
+
+
+if __name__ == '__main__':
+    main()

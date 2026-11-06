@@ -20,7 +20,7 @@ The installer puts the CLI in `~/.local/bin`. Add that directory to your `PATH` 
 
 1. Open **Network Troubleshooter** from your app launcher and select the Wi-Fi or Ethernet adapter you want to check.
 2. Read the results from **Link** through **Internet**. Use **Open sign-in** if the network requires a login.
-3. Choose **Repair connection** to retry a saved NetworkManager profile. If the first attempt fails and that profile is still active, the app can disconnect it and retry. It runs the checks again after repair.
+3. Choose **Repair connection** to retry a saved NetworkManager profile or wake a suspended USB Ethernet adapter. If repair is unavailable, the app explains what to check first. After an attempt, the app checks internet access through the selected adapter and records each step in the private report.
 4. To share results, choose **View report** → **Copy redacted**. The redacted report contains check statuses and repair outcomes. The private report includes adapter details and journal logs and is saved under `${XDG_STATE_HOME:-$HOME/.local/state}/network-troubleshooter/`.
 
 ![Network Troubleshooter showing a successful Ethernet diagnosis with sample data](docs/images/ethernet-diagnosis.png)
@@ -75,6 +75,17 @@ Save `portal.json` under `${XDG_CONFIG_HOME:-$HOME/.config}/network-troubleshoot
 ```
 
 You can configure `wifi`, `ethernet`, or both. The app appends the adapter name and HTTP probe URL to the argument list. Your helper should return once it opens the window and exit nonzero if launch fails. The app uses the default launcher for any adapter type without an entry.
+
+## Wake USB Ethernet
+
+When a USB Ethernet adapter is runtime-suspended and reports no link, **Repair connection** can wake its USB device and wait for NetworkManager to connect. It restores the device’s original USB power policy after checking for a link.
+
+To enable this repair, install the privileged helper from the repository directory.
+
+```sh
+pkexec /usr/bin/install -D -o root -g root -m 0755 "$PWD/wake-usb-ethernet" \
+  /usr/local/libexec/network-troubleshooter-wake-usb-ethernet
+```
 
 ## Configure a driver recovery service
 

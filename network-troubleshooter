@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from html import escape, unescape
 from urllib.parse import quote, urlsplit
 
@@ -26,6 +27,7 @@ ENV = {**os.environ, 'LC_ALL': 'C'}
 CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter'
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
 RECOVERY_UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service')
+USB_WAKE_HELPER = '/usr/local/libexec/network-troubleshooter-wake-usb-ethernet'
 
 
 def run(*args, timeout=5):
@@ -114,7 +116,7 @@ def edit_ping_target(current):
     try:
         return parse_ping_target(value)
     except ValueError:
-        desktop('--error', '--no-markup',
+        desktop('--image=dialog-error', '--no-markup',
                 '--text=Enter an IP address such as 192.168.1.1 or fe80::1.',
                 '--button=Close:0')
         return current
@@ -175,7 +177,9 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     if kind == 'Ethernet':
         carrier = data.get('WIRED-PROPERTIES.CARRIER')
         if carrier == 'off':
-            rows['Link'] = ('No cable link', 'Check the Ethernet cable, dock, or switch.')
+            hint = ('Use Repair connection to wake the suspended USB Ethernet adapter.'
+                    if usb_wake_available(device) else 'Check the Ethernet cable, dock, or switch.')
+            rows['Link'] = ('No cable link', hint)
             return 'Ethernet link is down', rows, '', portal
         if carrier != 'on':
             rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.')
@@ -323,18 +327,26 @@ def adapter_driver(device):
     return link.resolve().name if link.is_symlink() else ''
 
 
-def driver_recovery_allowed(device, kind, driver):
+def driver_recovery_blocker(device, kind, driver):
     if adapter_driver(device) != driver:
-        return False
+        return 'The adapter no longer uses the configured driver.'
     if run('nmcli', '-g', 'GENERAL.AUTOCONNECT', 'device', 'show', device) != (0, 'yes'):
-        return False
+        return 'NetworkManager does not currently allow this adapter to autoconnect.'
     if kind == 'Ethernet':
-        return run('nmcli', '-g', 'GENERAL.STATE', 'device', 'show', device)[1].startswith('30 ')
+        code, output = run('nmcli', '-g', 'GENERAL.STATE,WIRED-PROPERTIES.CARRIER',
+                           'device', 'show', device)
+        state, _, carrier = output.partition('\n')
+        if code or not state.startswith('30 ') or carrier != 'on':
+            return 'Ethernet driver recovery requires a disconnected adapter with carrier.'
+        return ''
+    if run('nmcli', '-g', 'WIFI', 'radio') != (0, 'enabled'):
+        return 'The Wi-Fi radio is off or its state could not be read.'
     code, output = run('nmcli', '-t', '-f', 'DEVICE,TYPE', 'device', 'status')
     if code or [line for line in output.splitlines() if line.endswith(':wifi')] != [f'{device}:wifi']:
-        return False
-    return (run('iw', 'dev', device, 'link') == (0, 'Not connected.')
-            and run('nmcli', '-g', 'WIFI', 'radio') == (0, 'enabled'))
+        return 'Wi-Fi driver recovery requires exactly one Wi-Fi adapter.'
+    if run('iw', 'dev', device, 'link') != (0, 'Not connected.'):
+        return 'The adapter has joined Wi-Fi or its link state could not be read.'
+    return ''
 
 
 def profile_matches_kind(profile, kind):
@@ -374,11 +386,10 @@ def configure_recovery(device, profile, unit):
 
 
 def configured_recovery(device, kind, config, reconnect):
-    if not config or config[0] != device:
+    if not config or config[0] != device or (reconnect and reconnect != config[1]):
         return None
     _, profile, driver, unit = config
-    if ((reconnect == profile or not reconnect and driver_recovery_allowed(device, kind, driver))
-            and profile_matches_kind(profile, kind) and recovery_unit_loaded(unit)):
+    if profile_matches_kind(profile, kind):
         return profile, driver, unit
     return None
 
@@ -388,7 +399,44 @@ def reconnect_profile(device, profile):
                timeout=28)
 
 
-def repair_connection(device, kind, profile, recovery, activity, steps):
+def active_profile(device):
+    code, output = run('nmcli', '-t', '-e', 'no', '-f', 'GENERAL.STATE,GENERAL.CON-UUID',
+                       'device', 'show', device)
+    data = dict(line.split(':', 1) for line in output.splitlines() if ':' in line)
+    if code or 'GENERAL.STATE' not in data or 'GENERAL.CON-UUID' not in data:
+        return None, ''
+    state = data['GENERAL.STATE'].partition(' ')[0]
+    return state, data['GENERAL.CON-UUID']
+
+
+def usb_wake_available(device):
+    return run(USB_WAKE_HELPER, '--check', device)[0] == 0
+
+
+def repair_usb_ethernet(device, attempt):
+    code, output = attempt('Wake USB Ethernet. Approve authentication if prompted.',
+                           lambda: run('/usr/bin/pkexec', '--disable-internal-agent',
+                                       USB_WAKE_HELPER, device, timeout=None))
+    if code in (126, 127):
+        return code, 'Authentication was cancelled or unavailable.'
+    if code:
+        return code, output
+
+    def wait_for_networkmanager():
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            state, _ = active_profile(device)
+            if state == '100':
+                return 0, 'NetworkManager activated the wired connection.'
+            if state is None:
+                return 1, 'The Ethernet adapter became unavailable.'
+            time.sleep(0.5)
+        return 1, 'The USB adapter reported a link, but NetworkManager did not finish connecting.'
+
+    return attempt('Wait for NetworkManager to connect Ethernet', wait_for_networkmanager)
+
+
+def repair_connection(device, kind, profile, recovery, attempt, *, wake_usb=False):
     locks = STATE_DIR / 'locks'
     locks.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (locks / f'{quote(device, safe="")}.lock').open('a') as lock:
@@ -396,25 +444,33 @@ def repair_connection(device, kind, profile, recovery, activity, steps):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 1, 'Another repair is already running for this adapter.'
-        return repair_locked(device, kind, profile, recovery, activity, steps)
+        if wake_usb:
+            return repair_usb_ethernet(device, attempt)
+        return repair_locked(device, kind, profile, recovery, attempt)
 
 
-def repair_locked(device, kind, profile, recovery, activity, steps):
-    def attempt(label, operation):
-        code, output = activity(label, operation)
-        steps.append((label, code, output))
-        return code, output
+def repair_locked(device, kind, profile, recovery, attempt):
+    initial_state, current = active_profile(device)
+    if initial_state is None or current not in ('', '--', profile):
+        return 1, 'The adapter or its active profile changed. Check it again before repairing.'
 
     code, output = attempt('Reconnect saved profile', lambda: reconnect_profile(device, profile))
     if code == 0:
         return code, output
 
-    current = run('nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', device)
-    if current[0] != 0 or current[1] not in ('', '--', profile):
+    state, current = active_profile(device)
+    if initial_state != '100' and state == '100' and current == profile:
+        return 0, 'The saved profile finished connecting.'
+    if state is None or current not in ('', '--', profile):
         return code, output
 
-    if recovery and driver_recovery_allowed(device, kind, recovery[1]):
+    if recovery and state != '100':
         _, driver, unit = recovery
+        blocker = driver_recovery_blocker(device, kind, driver)
+        if not blocker and not recovery_unit_loaded(unit):
+            blocker = f'{unit} is not loaded.'
+        if blocker:
+            return code, f'{output}\n\nDriver recovery skipped. {blocker}'
         code, output = attempt('Restart adapter via recovery service. Approve authentication if prompted.',
                                lambda: run('/usr/bin/pkexec', '/usr/bin/systemctl', '--wait', 'start',
                                            unit, timeout=150))
@@ -422,14 +478,18 @@ def repair_locked(device, kind, profile, recovery, activity, steps):
             return code, 'Authentication was cancelled or unavailable.'
         if code == 124:
             return code, 'The driver recovery service did not finish in time.'
-        if not driver_recovery_allowed(device, kind, driver):
-            if run('nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', device) == (0, profile):
-                return 0, ''
-            return 1, output or 'The adapter state changed during driver recovery.'
+        if code:
+            return code, output or f'{unit} failed. See the recovery service log in the report.'
+        state, current = active_profile(device)
+        if state == '100' and current == profile:
+            return 0, 'The saved profile reconnected after driver recovery.'
+        if (state is None or current not in ('', '--', profile)
+                or driver_recovery_blocker(device, kind, driver)):
+            return 1, 'The saved profile is still down and the adapter state prevents another retry.'
         return attempt('Reconnect after driver recovery',
                        lambda: reconnect_profile(device, profile))
 
-    if current[1] == profile:
+    if current == profile:
         code, output = attempt('Disconnect selected adapter',
                                lambda: run('nmcli', '-w', '8', 'device', 'disconnect', device, timeout=10))
         if code:
@@ -474,21 +534,21 @@ def view_report(path, redacted):
         try:
             subprocess.run(['wl-copy'], input=redacted, text=True, check=True, timeout=5)
         except (OSError, subprocess.SubprocessError) as error:
-            desktop('--error', '--no-markup', f'--text=Could not copy report: {error}', '--button=Close:0')
+            desktop('--image=dialog-error', '--no-markup',
+                    f'--text=Could not copy report: {error}', '--button=Close:0')
 
 
-def show(device, kind, result, recovery):
-    headline, rows, reconnect, portal = result
-    buttons = ['--button=Close:0', '--button=View report:16', '--button=Choose adapter:10', '--button=Ping target:14',
-               '--button=Check again:11']
-    if reconnect or recovery:
-        buttons += ['--button=Repair connection:12']
+def show(device, kind, result, repair_notice=''):
+    headline, rows, _, portal = result
+    buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=View report:16',
+               '--button=Ping target:14', '--button=Check again:11', '--button=Repair connection:12']
     if portal:
         label = 'Open sign-in' if rows['Sign-in'][0] == 'Required' else 'Try sign-in'
         buttons += [f'--button={label}:13']
     cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
+    notice = f'\n{escape(repair_notice)}' if repair_notice else ''
     return desktop('--list', '--width=720', '--height=320', '--text-width=75',
-                   f'--text=<b>{escape(headline)}</b>\n{escape(kind)} · {escape(device)}',
+                   f'--text=<b>{escape(headline)}</b>\n{escape(kind)} · {escape(device)}{notice}',
                    '--text-align=left', '--response=0', '--no-selection', '--grid-lines=horizontal',
                    '--column=Check', '--column=Result', '--column=Details',
                    '--expand-column=3', '--wrap-cols=3', '--wrap-width=395',
@@ -547,8 +607,8 @@ def main():
 
     device = args.device
     config = recovery_settings()
-    path = before = None
-    history = ''
+    path = before = snapshot = None
+    history = repair_notice = ''
     steps = []
 
     def scan():
@@ -565,7 +625,14 @@ def main():
             message = error or (f'Adapter {device} is unavailable.' if device else
                                 'No NetworkManager-managed Wi-Fi or Ethernet adapter was found.')
             if args.gui:
-                desktop('--info', '--no-markup', f'--text={message}', '--button=Close:0')
+                action = desktop('--image=dialog-information', '--no-markup', f'--text={message}', '--button=Close:0',
+                                 '--button=Choose adapter:10', '--button=Check again:11').returncode
+                if action == 10:
+                    device = path = before = snapshot = None
+                    history = repair_notice = ''
+                    steps = []
+                if action in (10, 11):
+                    continue
             else:
                 print(message, file=sys.stderr)
             return 1
@@ -586,37 +653,48 @@ def main():
             with tempfile.NamedTemporaryFile(prefix='network-', suffix='.txt', dir=STATE_DIR,
                                              delete=False) as report:
                 path = Path(report.name)
-        result, recovery, private = scan()
+        result, recovery, private = snapshot if snapshot is not None else scan()
+        snapshot = None
         path.write_text(('After repair\n' if before else '') + private + history + '\n',
                         encoding='utf-8')
         redacted = redacted_report(kind, result, steps, before)
-        action = show(device, kind, result, recovery) if args.gui else 12 if args.repair else 13 if args.sign_in else 0
+        action = show(device, kind, result, repair_notice) if args.gui else 12 if args.repair else 13 if args.sign_in else 0
         while action == 16:
             view_report(path, redacted)
-            action = show(device, kind, result, recovery)
+            action = show(device, kind, result, repair_notice)
         code = 0
 
         if action == 10:
             device = path = before = None
-            history = ''
+            history = repair_notice = ''
             steps = []
             continue
         if action == 14:
             ping_target = edit_ping_target(ping_target)
             continue
         if action == 11:
+            repair_notice = ''
             continue
         if action == 12:
             profile = recovery[0] if recovery else result[2]
+            link_status, link_detail = result[1]['Link']
+            wake_usb = kind == 'Ethernet' and link_status == 'No cable link' and usb_wake_available(device)
+            blocked = link_status in ('Off', 'No cable link', 'Unavailable') and not wake_usb
             message = (f'Retry the saved profile on {device}? If it fails, the app will retry after '
                        'disconnecting that connection if it is active.')
             if recovery:
-                message += (' If the driver recovery service can run, it may restart the adapter '
-                            'and ask for authentication.')
-            if not profile:
-                code, output = 1, 'No saved profile is available to repair on this adapter.'
+                message = (f'Retry the saved profile on {device}? If it fails, the app can restart '
+                           'the adapter using the configured recovery service and may ask for authentication.')
+            if wake_usb:
+                message = ('Wake the USB Ethernet adapter and check the connection? '
+                           'You may be asked to authenticate.')
+            if blocked:
+                code, output = 1, f'{result[0]}. {link_detail}'
+            elif not profile and not wake_usb:
+                code, output = 1, ('No single saved profile could be selected. Choose the network '
+                                   'from your network menu and check this adapter again.')
             elif args.gui:
-                confirmed = desktop('--question', '--no-markup',
+                confirmed = desktop('--image=dialog-question', '--no-markup',
                                     f'--text={message}', '--button=Cancel:1',
                                     '--button=Repair connection:0').returncode == 0
             elif args.yes:
@@ -627,22 +705,48 @@ def main():
             else:
                 parser.error('--repair requires --yes when stdin is not a terminal')
 
-            if profile and confirmed:
+            if code == 0 and confirmed:
                 before = result
+                before_report = private
+                previous_history = history
                 steps = []
-                code, output = repair_connection(device, kind, profile, recovery, activity, steps)
-                steps.append(('Repair result', code, output))
-                attempts = '\n\n'.join(f'{label} (exit {status})\n{detail}'
-                                         for label, status, detail in steps)
-                history = f'\n\nRepair attempts\n{attempts}\n\nBefore repair\n{private}{history}'
+
+                def save_attempts(pending=''):
+                    attempts = [f'{label} (exit {status})\n{detail}' for label, status, detail in steps]
+                    if pending:
+                        attempts.append(f'{pending}\nIn progress')
+                    return ('\n\nRepair attempts\n' + '\n\n'.join(attempts)
+                            + f'\n\nBefore repair\n{before_report}{previous_history}')
+
+                def attempt(label, operation):
+                    path.write_text(save_attempts(label).lstrip() + '\n', encoding='utf-8')
+                    outcome = activity(label, operation)
+                    steps.append((label, *outcome))
+                    path.write_text(save_attempts().lstrip() + '\n', encoding='utf-8')
+                    return outcome
+
+                code, output = repair_connection(device, kind, profile, recovery, attempt, wake_usb=wake_usb)
+                history = save_attempts('Checking this adapter again')
                 path.write_text(history.lstrip() + '\n', encoding='utf-8')
-                if not args.gui:
-                    result, recovery, private = scan()
-                    private = f'After repair\n{private}{history}\n'
-                    path.write_text(private, encoding='utf-8')
-                    redacted = redacted_report(kind, result, steps, before)
-            elif profile:
+                result, recovery, private = scan()
+                if code:
+                    repair_notice = 'Repair stopped. View the report for the steps and error.'
+                elif result[1]['Sign-in'][0] == 'Required':
+                    code, output = 1, 'The connection is up. Open sign-in to get internet access.'
+                    repair_notice = output
+                elif result[1]['Internet'][0] != 'Reached':
+                    code, output = 1, 'The reconnect command finished, but this adapter did not pass the internet check.'
+                    repair_notice = output
+                else:
+                    repair_notice = 'Repair complete. Internet access verified.'
+                steps.append(('Repair result', code, output))
+                history = save_attempts()
+                path.write_text(f'After repair\n{private}{history}\n', encoding='utf-8')
+                redacted = redacted_report(kind, result, steps, before)
+                snapshot = result, recovery, private
+            elif code == 0:
                 if args.gui:
+                    snapshot = result, recovery, private
                     continue
                 code, output = 1, 'Repair cancelled.'
         elif action == 13:
@@ -657,7 +761,7 @@ def main():
 
         if code:
             if args.gui:
-                desktop('--error', '--no-markup', f'--text={output}', '--button=Close:0')
+                desktop('--image=dialog-error', '--no-markup', f'--text={output}', '--button=Close:0')
             else:
                 print(output, file=sys.stderr)
         if args.gui:
