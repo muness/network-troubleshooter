@@ -27,7 +27,7 @@ ENV = {**os.environ, 'LC_ALL': 'C'}
 CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'network-troubleshooter'
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
 RECOVERY_UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service')
-USB_WAKE_HELPER = '/usr/local/libexec/network-troubleshooter-wake-dock-ethernet'
+USB_WAKE_HELPER = '/usr/local/libexec/network-troubleshooter-wake-usb-ethernet'
 
 
 def run(*args, timeout=5):
@@ -177,8 +177,8 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     if kind == 'Ethernet':
         carrier = data.get('WIRED-PROPERTIES.CARRIER')
         if carrier == 'off':
-            hint = ('Use Repair connection to wake the dock’s Ethernet adapter.'
-                    if usb_wake_supported(device) else 'Check the Ethernet cable, dock, or switch.')
+            hint = ('Use Repair connection to wake the suspended USB Ethernet adapter.'
+                    if usb_wake_available(device) else 'Check the Ethernet cable, dock, or switch.')
             rows['Link'] = ('No cable link', hint)
             return 'Ethernet link is down', rows, '', portal
         if carrier != 'on':
@@ -409,12 +409,12 @@ def active_profile(device):
     return state, data['GENERAL.CON-UUID']
 
 
-def usb_wake_supported(device):
+def usb_wake_available(device):
     return run(USB_WAKE_HELPER, '--check', device)[0] == 0
 
 
 def repair_usb_ethernet(device, attempt):
-    code, output = attempt('Wake dock USB Ethernet. Approve authentication if prompted.',
+    code, output = attempt('Wake USB Ethernet. Approve authentication if prompted.',
                            lambda: run('/usr/bin/pkexec', '--disable-internal-agent',
                                        USB_WAKE_HELPER, device, timeout=None))
     if code in (126, 127):
@@ -431,7 +431,7 @@ def repair_usb_ethernet(device, attempt):
             if state is None:
                 return 1, 'The Ethernet adapter became unavailable.'
             time.sleep(0.5)
-        return 1, 'The dock has an Ethernet link, but NetworkManager did not finish connecting.'
+        return 1, 'The USB adapter reported a link, but NetworkManager did not finish connecting.'
 
     return attempt('Wait for NetworkManager to connect Ethernet', wait_for_networkmanager)
 
@@ -678,7 +678,7 @@ def main():
         if action == 12:
             profile = recovery[0] if recovery else result[2]
             link_status, link_detail = result[1]['Link']
-            wake_usb = kind == 'Ethernet' and link_status == 'No cable link' and usb_wake_supported(device)
+            wake_usb = kind == 'Ethernet' and link_status == 'No cable link' and usb_wake_available(device)
             blocked = link_status in ('Off', 'No cable link', 'Unavailable') and not wake_usb
             message = (f'Retry the saved profile on {device}? If it fails, the app will retry after '
                        'disconnecting that connection if it is active.')
@@ -686,7 +686,7 @@ def main():
                 message = (f'Retry the saved profile on {device}? If it fails, the app can restart '
                            'the adapter using the configured recovery service and may ask for authentication.')
             if wake_usb:
-                message = ('Wake the dock’s Ethernet adapter and check the connection? '
+                message = ('Wake the USB Ethernet adapter and check the connection? '
                            'You may be asked to authenticate.')
             if blocked:
                 code, output = 1, f'{result[0]}. {link_detail}'
