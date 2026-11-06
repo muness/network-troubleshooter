@@ -20,7 +20,7 @@ The installer puts the CLI in `~/.local/bin`. Add that directory to your `PATH` 
 
 1. Open **Network Troubleshooter** from your app launcher and select the Wi-Fi or Ethernet adapter you want to check.
 2. Read the results from **Link** through **Internet**. Use **Open sign-in** if the network requires a login.
-3. Choose **Repair connection** to retry a saved NetworkManager profile. If the first attempt fails and that profile is still active, the app can disconnect it and retry. It runs the checks again after repair.
+3. Choose **Repair connection** to retry a saved NetworkManager profile. If the adapter has no Ethernet link or Wi-Fi is off, the app explains what to check first. After an attempt, the app checks internet access through the selected adapter and records each step in the private report.
 4. To share results, choose **View report** → **Copy redacted**. The redacted report contains check statuses and repair outcomes. The private report includes adapter details and journal logs and is saved under `${XDG_STATE_HOME:-$HOME/.local/state}/network-troubleshooter/`.
 
 ![Network Troubleshooter showing a successful Ethernet diagnosis with sample data](docs/images/ethernet-diagnosis.png)
