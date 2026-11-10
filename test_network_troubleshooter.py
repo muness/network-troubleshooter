@@ -354,6 +354,30 @@ class NetworkTests(unittest.TestCase):
             run.assert_called_once_with('/usr/bin/helper', '--open-device', 'wlan1',
                                         'http://probe.example/', timeout=15)
 
+    def test_portal_launch_keeps_the_selected_adapter_open_until_rechecked(self):
+        url = 'http://probe.example/'
+        captive = ('Sign in to use this network', {'Sign-in': ('Required', '')}, '', url)
+        online = ('Internet access verified', {'Sign-in': ('Not detected', '')}, '', '')
+        diagnose = Mock(side_effect=[captive, online])
+        launch = Mock(return_value=(0, ''))
+        desktop = Mock(side_effect=[Mock(returncode=13), Mock(returncode=11), Mock(returncode=0)])
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+                env, STATE_DIR=Path(temp), recovery_settings=lambda: None,
+                adapters=lambda: ([('eth0', 'Ethernet', 'connected'), ('wlan1', 'Wi-Fi', 'connected')], ''),
+                diagnose=diagnose, launch_portal=launch, desktop=desktop,
+                working=lambda message, operation: operation(), report_text=lambda *args: 'Test report'), patch.object(
+                    sys, 'argv', ['network-troubleshooter', '--gui', '--device', 'eth0']):
+            self.assertEqual(app['main'](), 0)
+            report = next(Path(temp).glob('network-*.txt')).read_text()
+        launch.assert_called_once_with('eth0', 'Ethernet', url)
+        first, after_launch, after_check = [call.args for call in desktop.call_args_list]
+        self.assertIn('--button=Launch portal:13', first)
+        self.assertIn('--button=Check again:11', after_launch)
+        self.assertTrue(any('After signing in, check this adapter again.' in arg for arg in after_launch))
+        self.assertNotIn('--button=Launch portal:13', after_check)
+        self.assertEqual([call.args[0] for call in diagnose.call_args_list], ['eth0', 'eth0'])
+        self.assertIn('Sign-in handoff (exit 0)', report)
+
 
 class USBWakeTests(unittest.TestCase):
     def setUp(self):
