@@ -28,6 +28,9 @@ CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') 
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'network-troubleshooter'
 RECOVERY_UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service')
 USB_WAKE_HELPER = '/usr/local/libexec/network-troubleshooter-wake-usb-ethernet'
+SYS_NET = Path('/sys/class/net')
+USB_BUS = Path('/sys/bus/usb')
+GENERIC_USB_ETHERNET_DRIVERS = {'cdc_ether', 'cdc_ncm', 'rndis_host'}
 
 
 def run(*args, timeout=5):
@@ -151,6 +154,68 @@ def gateway_check(device, data):
     return ping_check(device, gateways)
 
 
+def usb_configuration_classes(descriptors):
+    """Read interface classes at alternate setting zero in each USB configuration."""
+    configurations = {}
+    classes = None
+    offset = 0
+    while offset + 2 <= len(descriptors):
+        length, kind = descriptors[offset:offset + 2]
+        if length < 2 or offset + length > len(descriptors):
+            return {}
+        descriptor = descriptors[offset:offset + length]
+        if kind == 2 and length >= 9:  # Configuration descriptor
+            classes = configurations.setdefault(descriptor[5], set())
+        elif kind == 4 and length >= 9 and classes is not None and descriptor[3] == 0:
+            classes.add(descriptor[5])  # bInterfaceClass
+        offset += length
+    return configurations if offset == len(descriptors) else {}
+
+
+def usb_ethernet_link_hint(device, details):
+    """Collect evidence for a USB Ethernet adapter that reports no carrier."""
+    try:
+        interface = (SYS_NET / device / 'device').resolve(strict=True)
+        if (interface / 'subsystem').resolve() != USB_BUS:
+            return ''
+        usb = interface.parent
+        driver = (interface / 'driver').readlink().name
+        usb_id = ':'.join((usb / attr).read_text().strip() for attr in ('idVendor', 'idProduct'))
+        active = (usb / 'bConfigurationValue').read_text().strip()
+    except OSError:
+        return ''
+
+    details.append(f'USB Ethernet: {usb_id} at {usb.name}, driver {driver}, configuration {active}')
+    try:
+        power = (usb / 'power/runtime_status').read_text().strip()
+        details.append(f'USB runtime power state: {power}')
+    except OSError:
+        pass
+    try:
+        configs = usb_configuration_classes((usb / 'descriptors').read_bytes())
+    except OSError:
+        configs = {}
+    vendor_modes = [str(number) for number, classes in sorted(configs.items())
+                    if str(number) != active and classes == {0xff}]
+    if configs:
+        modes = ', '.join(vendor_modes) or 'none found'
+        details.append(f'Alternate vendor-specific USB configurations: {modes}')
+
+    port = re.escape(usb.name)
+    code, logs = run('journalctl', '-b', '-k', '--since=-15min', '-n', '35', '--no-pager',
+                     '-o', 'cat', '--grep', rf'(^|\s){port}([:\s]|$)')
+    details.append(f'Recent USB adapter kernel messages (last 15 minutes):\n'
+                   f'{logs or "No matching messages available."}')
+    resets = sum(line.startswith(f'usb {usb.name}: reset ') for line in logs.splitlines()) if code == 0 else 0
+    hints = []
+    if resets >= 2:
+        hints.append('The kernel logged repeated resets of this USB adapter.')
+    if driver in GENERIC_USB_ETHERNET_DRIVERS and vendor_modes:
+        hints.append(f'The adapter uses the generic {driver} driver and offers a vendor-specific USB mode. '
+                     f'If the cable and switch port work, check native driver support for {usb_id}.')
+    return ' '.join(hints)
+
+
 def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     details = details if details is not None else []
     rows = {step: ('Skipped', 'Requires an active link with an IP address.')
@@ -177,8 +242,11 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     if kind == 'Ethernet':
         carrier = data.get('WIRED-PROPERTIES.CARRIER')
         if carrier == 'off':
+            usb_hint = usb_ethernet_link_hint(device, details)
             hint = ('Use Repair connection to wake the suspended USB Ethernet adapter.'
                     if usb_wake_available(device) else 'Check the Ethernet cable, dock, or switch.')
+            if usb_hint:
+                hint = f'{hint} {usb_hint}'
             rows['Link'] = ('No cable link', hint)
             return 'Ethernet link is down', rows, '', portal
         if carrier != 'on':

@@ -78,6 +78,8 @@ You can configure `wifi`, `ethernet`, or both. The app appends the adapter name 
 
 ## Wake USB Ethernet
 
+When a USB Ethernet adapter has no link, the private report identifies the USB device, driver, active configuration, power state, and available kernel messages for that adapter. The Link check flags repeated USB resets and points you toward native driver support when a generic driver is active and the adapter exposes another vendor-specific mode. These clues help narrow the cause after checking the cable and switch port. The diagnostic does not switch USB modes or drivers.
+
 When a USB Ethernet adapter is runtime-suspended and reports no link, **Repair connection** can wake its USB device and wait for NetworkManager to connect. It restores the device’s original USB power policy after checking for a link.
 
 To enable this repair, install the privileged helper from the repository directory.
