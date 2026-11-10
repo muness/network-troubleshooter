@@ -47,6 +47,8 @@ class NetworkTests(unittest.TestCase):
                 if args[0] == 'journalctl':
                     self.assertIn('-k', args)
                     return 0, '\n'.join(line for line in journal if re.search(args[-1], line))
+                if args[:2] == ('ip', '-j'):
+                    return 2, 'No route'
                 self.fail(f'Unexpected command {args}')
 
             cdc_mode = configuration(1, 2)
@@ -95,6 +97,120 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(rows['Sign-in'][0], 'Unverified')
         self.assertEqual(portal, 'http://probe.example/')
 
+    def test_system_route_can_differ_from_the_working_selected_adapter(self):
+        def command(*args, **kwargs):
+            if args[:2] == ('nmcli', '-t'):
+                return 0, ('GENERAL.STATE:100 (connected)\nWIRED-PROPERTIES.CARRIER:on\n'
+                           'IP4.ADDRESS[1]:192.0.2.5/24\nIP6.ADDRESS[1]:2001:db8::5/64')
+            if args[0] == 'ip':
+                if args[1] == '-j':
+                    self.assertNotIn('oif', args)
+                    return 0, '[{"dev":"tun0"}]' if args[2] == '-4' else '[{"dev":"eth0"}]'
+                self.assertEqual(args[-2:], ('oif', 'eth0'))
+                return 0, ''
+            if args[0] == 'curl':
+                return 0, '200'
+            return 0, ''
+
+        with patch.dict(env, run=command):
+            result = app['diagnose']('eth0', 'Ethernet')
+        rows = result[1]
+        self.assertEqual(rows['Route'], ('Found', 'IPv4, IPv6'))
+        self.assertEqual(rows['System route'][0], 'Mixed')
+        self.assertIn('IPv4 to 1.1.1.1 via tun0', rows['System route'][1])
+        self.assertIn('IPv6 to 2606:4700:4700::1111 via eth0', rows['System route'][1])
+        self.assertEqual(rows['Internet'][0], 'Reached')
+
+    def test_gateway_ping_timeout_distinguishes_failed_pending_and_known_neighbors(self):
+        for entry, expected in [
+            ('[{"state":["FAILED"]}]', 'neighbor resolution failed'),
+            ('[{"state":["INCOMPLETE"]}]', 'neighbor resolution pending'),
+            ('[{"state":["STALE"],"lladdr":"02:00:00:00:00:01"}]', 'link-layer address known'),
+            ('[]', 'neighbor state unknown'),
+        ]:
+            with self.subTest(entry=entry):
+                run = Mock(side_effect=[(1, ''), (0, entry)])
+                with patch.dict(env, run=run):
+                    self.assertEqual(app['gateway_check']('eth0', {'IP6.GATEWAY': 'fe80::1%eth0'}),
+                                     ('No reply', f'fe80::1 (no reply, {expected})'))
+                run.assert_called_with('ip', '-j', '-6', 'neigh', 'show', 'to', 'fe80::1', 'dev', 'eth0')
+
+    def test_missing_address_reports_activation_reason_and_pending_state(self):
+        for state, reason, status, note in [
+            ('120 (failed)', '17 (DHCP client failed)', 'Missing', 'DHCP client failed'),
+            ('120 (failed)', '5 (IP configuration could not be reserved)', 'Missing', 'could not be reserved'),
+            ('70 (connecting (getting IP configuration))', '0 (No reason given)', 'Pending', 'still configuring'),
+        ]:
+            with self.subTest(state=state, reason=reason):
+                def command(*args):
+                    if args[:2] == ('ip', '-j'):
+                        return 2, 'No route'
+                    self.assertIn('GENERAL.REASON', args[5])
+                    return 0, (f'GENERAL.STATE:{state}\nGENERAL.REASON:{reason}\n'
+                               'WIRED-PROPERTIES.CARRIER:on')
+
+                with patch.dict(env, run=command):
+                    rows = app['diagnose']('eth0', 'Ethernet')[1]
+                self.assertEqual(rows['IP address'][0], status)
+                self.assertIn(note, rows['IP address'][1])
+                self.assertNotIn('DHCP server', rows['IP address'][1])
+
+    def test_ethernet_link_only_flags_counter_growth_on_the_same_interface(self):
+        for after_index, after_crc, expected in [('7', '8', True), ('7', '5', False),
+                                                  ('8', '8', False), ('7', '0', False)]:
+            with self.subTest(after_index=after_index, after_crc=after_crc):
+                with tempfile.TemporaryDirectory() as temp:
+                    adapter = Path(temp) / 'eth0'
+                    (adapter / 'statistics').mkdir(parents=True)
+                    for attribute, value in [('ifindex', '7'), ('speed', '2500'), ('duplex', 'full'),
+                                             ('statistics/rx_crc_errors', after_crc)]:
+                        (adapter / attribute).write_text(value)
+
+                    def diagnose_adapter(*args):
+                        (adapter / 'ifindex').write_text(after_index)
+                        return '', {'Link': ('Up', '')}, '', ''
+
+                    with patch.dict(env, SYS_NET=adapter.parent, diagnose_adapter=diagnose_adapter,
+                                    system_route_check=lambda _: ('Unverified', '')):
+                        history = {'eth0': ('7', {'receive CRC errors': 5})}
+                        link = app['diagnose']('eth0', 'Ethernet', ethernet_history=history)[1]['Link'][1]
+                self.assertIn('2,500 Mbps, full duplex', link)
+                self.assertEqual('Since the last check: receive CRC errors +3' in link, expected)
+
+    def test_custom_dns_compares_links_without_changing_the_public_https_probe(self):
+        def command(*args, **kwargs):
+            if args[:2] == ('nmcli', '-t'):
+                return 0, ('GENERAL.STATE:100 (connected)\nWIRED-PROPERTIES.CARRIER:on\n'
+                           'IP4.ADDRESS[1]:192.0.2.5/24')
+            if args[:2] == ('resolvectl', 'domain'):
+                return 0, 'Link 7 (eth0): ~office.example'
+            if args[0] == 'resolvectl':
+                if args[-1] == 'private.office.example':
+                    return (1, 'Lookup timed out') if '-i' in args else (
+                        0, 'private.office.example: 192.0.2.42 -- link: tun0')
+                self.assertEqual(args[-1], 'archlinux.org')
+                return 0, 'archlinux.org IN A 192.0.2.80 -- link: eth0'
+            if args[0] == 'curl':
+                self.assertIn('archlinux.org:443:192.0.2.80', args)
+                self.assertIn('if!eth0', args)
+                self.assertEqual(args[-1], 'https://archlinux.org/')
+                return 0, '200'
+            return 0, ''
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+                env, run=command, STATE_DIR=Path(temp), recovery_settings=lambda: None,
+                adapters=lambda: ([('eth0', 'Ethernet', 'connected')], '')), patch.object(
+                    sys, 'argv', ['network-troubleshooter', '--device', 'eth0', '--dns-target',
+                                  'private.office.example', '--redacted-report']):
+            with redirect_stderr(StringIO()), redirect_stdout(StringIO()) as stdout:
+                self.assertEqual(app['main'](), 0)
+            report = next(Path(temp).glob('network-*.txt')).read_text()
+        self.assertIn('Internet — Reached', stdout.getvalue())
+        self.assertIn('DNS target — Unverified', stdout.getvalue())
+        self.assertIn('System resolver: answer via tun0', report)
+        self.assertIn('~office.example', report)
+        self.assertNotIn('office.example', stdout.getvalue())
+
     def test_redacted_report_drops_raw_evidence(self):
         before = ('Example SSID', {'Link': ('Joined', 'Example SSID')}, 'private-uuid', '')
         after = ('Offline', {'Gateway': ('No reply', '192.0.2.1 (no reply)')}, '', '')
@@ -126,6 +242,7 @@ class NetworkTests(unittest.TestCase):
         with patch.dict(env, desktop=desktop):
             self.assertEqual(app['show']('eth0', 'Ethernet', result), 12)
         self.assertIn('--button=Repair connection:12', desktop.call_args.args)
+        self.assertIn('--button=DNS target:18', desktop.call_args.args)
 
     def test_repair_refuses_to_switch_profiles_after_diagnosis(self):
         attempt = Mock()
@@ -220,7 +337,7 @@ class NetworkTests(unittest.TestCase):
                 env, STATE_DIR=Path(temp), recovery_settings=lambda: None,
                 adapters=lambda: ([('eth0', 'Ethernet', 'unavailable')], ''),
                 usb_wake_available=lambda name: False, repair_connection=repair,
-                diagnose=lambda *args: result, report_text=lambda *args: 'Test snapshot'), patch.object(
+                diagnose=lambda *args, **kwargs: result, report_text=lambda *args: 'Test snapshot'), patch.object(
                     sys, 'argv', ['network-troubleshooter', '--repair', '--yes']):
             with redirect_stderr(StringIO()) as stderr, redirect_stdout(StringIO()):
                 self.assertEqual(app['main'](), 1)
