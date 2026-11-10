@@ -3,6 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import fcntl
 from io import StringIO
 from pathlib import Path
+import re
 import runpy
 import sys
 import tempfile
@@ -15,6 +16,61 @@ wake = runpy.run_path(str(Path(__file__).with_name('wake-usb-ethernet')))['wake'
 
 
 class NetworkTests(unittest.TestCase):
+    def test_no_carrier_surfaces_usb_driver_mode_and_device_scoped_resets(self):
+        def configuration(number, interface_class):
+            return bytes((9, 2, 18, 0, 1, number, 0, 128, 50,
+                          9, 4, 0, 0, 0, interface_class, 0, 0, 0))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            usb = root / '3-2.1'
+            interface = usb / '3-2.1:1.0'
+            interface.mkdir(parents=True)
+            adapter = root / 'net' / 'eth0'
+            adapter.mkdir(parents=True)
+            (adapter / 'device').symlink_to(interface)
+            (interface / 'subsystem').symlink_to(root / 'usb')
+            (interface / 'driver').symlink_to(root / 'drivers' / 'cdc_ncm')
+            for name, value in [('idVendor', '1234'), ('idProduct', '5678'), ('bConfigurationValue', '1')]:
+                (usb / name).write_text(value + '\n')
+            (usb / 'power').mkdir()
+            (usb / 'power/runtime_status').write_text('active\n')
+
+            journal = ['usb 3-2: reset hub', 'usb 3-2.10: reset sibling',
+                       'usb 3-2.1: reset SuperSpeed USB device number 4',
+                       'cdc_ncm 3-2.1:1.0: adapter message',
+                       'usb 3-2.1: reset SuperSpeed USB device number 4']
+
+            def command(*args):
+                if args[0] == 'nmcli':
+                    return 0, 'GENERAL.STATE:20 (unavailable)\nWIRED-PROPERTIES.CARRIER:off'
+                if args[0] == 'journalctl':
+                    self.assertIn('-k', args)
+                    return 0, '\n'.join(line for line in journal if re.search(args[-1], line))
+                self.fail(f'Unexpected command {args}')
+
+            cdc_mode = configuration(1, 2)
+            for extra, vendor_hint in [(configuration(4, 255), True), (configuration(4, 2), False),
+                                       (configuration(4, 255)[:-1], False)]:
+                with self.subTest(extra=extra):
+                    (usb / 'descriptors').write_bytes(cdc_mode + extra)
+                    details = []
+                    with patch.dict(env, SYS_NET=adapter.parent, USB_BUS=root / 'usb',
+                                    run=command, usb_wake_available=lambda _: False):
+                        result = app['diagnose']('eth0', 'Ethernet', details=details)
+                    status, hint = result[1]['Link']
+                    self.assertEqual(status, 'No cable link')
+                    self.assertIn('Check the Ethernet cable', hint)
+                    self.assertIn('repeated resets', hint)
+                    self.assertEqual('native driver support for 1234:5678' in hint, vendor_hint)
+                    evidence = '\n'.join(details)
+                    self.assertIn('driver cdc_ncm, configuration 1', evidence)
+                    self.assertIn('USB runtime power state: active', evidence)
+                    self.assertIn('adapter message', evidence)
+                    self.assertNotIn('reset sibling', evidence)
+                    self.assertNotIn('reset hub', evidence)
+                    self.assertNotIn('1234:5678', app['redacted_report']('Ethernet', result, []))
+
     def test_gateway_and_sign_in_still_work_without_public_route(self):
         def command(*args, **kwargs):
             if args[:2] == ('nmcli', '-t'):
