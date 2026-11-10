@@ -29,16 +29,20 @@ The installer puts the CLI in `~/.local/bin`. Add that directory to your `PATH` 
 
 | Check | What it tells you |
 | --- | --- |
-| Link | Ethernet detects a cable link, or Wi-Fi has joined a network. |
-| IP address | The adapter has an IPv4 or IPv6 address beyond link-local. |
+| Link | Ethernet detects a cable link, or Wi-Fi has joined a network. When available, Ethernet shows speed, duplex, and increases in carrier losses or receive CRC errors. The first check samples during the scan. Later checks in the same session compare with the previous reading. |
+| IP address | The adapter has an IPv4 or IPv6 address beyond link-local. If none is assigned, look for NetworkManager's current activation reason or a pending configuration. |
 | Route | A route to the test destinations exists through this adapter. |
-| Gateway | The adapter’s configured router answers a ping. |
+| System route | The interface Linux picks for each test destination in an unbound lookup. VPN policy and application settings can affect the path of an individual connection. |
+| Gateway | The adapter’s configured router answers a ping. After a timeout, the check also shows whether the kernel knows the gateway's link-layer address. |
 | Ping | A target answers through this adapter. Defaults are `1.1.1.1` and `2606:4700:4700::1111`. Use **Ping target** or `--ping-target IP` to test another address. |
 | DNS | systemd-resolved returned an address for `archlinux.org` on this adapter. |
+| DNS target | An optional hostname lookup through the selected adapter and the system resolver. Shows the reported answer links and the selected adapter's DNS domains when available. Use **DNS target** or `--dns-target HOSTNAME`. |
 | Sign-in | NetworkManager detected a captive portal, such as a hotel Wi-Fi login page. |
 | Internet | An HTTPS request to `archlinux.org` through this adapter returned HTTP 200. |
 
 HTTPS can pass when ping gets no reply. The HTTPS check uses system DNS if the selected adapter yields no verified DNS answer. The HTTPS connection still goes through the selected adapter. Wi-Fi reports also include radio and link details and whether the saved network appears in the scan cache.
+
+Use **DNS target** to check a hostname that fails on a VPN or a local network. The custom lookup is separate from the public HTTPS probe. Hostnames and DNS domains appear in the private report. The redacted report includes only check statuses.
 
 ## Run from a terminal
 
@@ -48,6 +52,7 @@ Use the interface name from `--list-adapters` in place of `enp2s0` or `wlan0`.
 network-troubleshooter --list-adapters
 network-troubleshooter --device enp2s0
 network-troubleshooter --device enp2s0 --ping-target 192.168.1.1 --redacted-report
+network-troubleshooter --device enp2s0 --dns-target service.example.org
 network-troubleshooter --device enp2s0 --repair --redacted-report
 network-troubleshooter --device wlan0 --sign-in
 ```

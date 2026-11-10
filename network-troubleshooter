@@ -20,7 +20,7 @@ TITLE = 'Network Troubleshooter'
 NM = 'org.freedesktop.NetworkManager'
 TEST_HOST = 'archlinux.org'
 DEFAULT_TARGETS = {4: '1.1.1.1', 6: '2606:4700:4700::1111'}
-FIELDS = ('GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID,'
+FIELDS = ('GENERAL.STATE,GENERAL.REASON,GENERAL.CONNECTION,GENERAL.CON-UUID,'
           'WIRED-PROPERTIES.CARRIER,IP4.ADDRESS,IP6.ADDRESS,IP4.GATEWAY,IP6.GATEWAY,'
           'GENERAL.IP4-CONNECTIVITY,GENERAL.IP6-CONNECTIVITY,CONNECTIONS.AVAILABLE-CONNECTIONS')
 ENV = {**os.environ, 'LC_ALL': 'C'}
@@ -83,19 +83,22 @@ def addresses(fields):
     return families
 
 
+def ping_status(device, target):
+    family = ipaddress.ip_address(target).version
+    code, _ = run('ping', f'-{family}', '-n', '-I', device, '-c', '1', '-w', '2',
+                  target, timeout=3)
+    return {0: 'Replied', 1: 'No reply'}.get(code, 'Unavailable')
+
+
+def ping_summary(results, notes):
+    return (results[0] if len(set(results)) == 1 else 'Mixed'), ' · '.join(notes)
+
+
 def ping_check(device, targets):
     if not targets:
         return 'Skipped', 'No route to the default ping targets on this adapter.'
-    statuses = {0: 'Replied', 1: 'No reply'}
-    results = []
-    for target in targets:
-        family = ipaddress.ip_address(target).version
-        code, _ = run('ping', f'-{family}', '-n', '-I', device, '-c', '1', '-w', '2',
-                      target, timeout=3)
-        results.append(statuses.get(code, 'Unavailable'))
-    status = results[0] if len(set(results)) == 1 else 'Mixed'
-    details = ' · '.join(f'{target} ({result.lower()})' for target, result in zip(targets, results))
-    return status, details
+    results = [ping_status(device, target) for target in targets]
+    return ping_summary(results, [f'{target} ({result.lower()})' for target, result in zip(targets, results)])
 
 
 def parse_ping_target(value):
@@ -104,11 +107,26 @@ def parse_ping_target(value):
     return str(ipaddress.ip_address(value))
 
 
-def edit_ping_target(current):
+def parse_dns_target(value):
+    try:
+        host = value.encode('idna').decode('ascii')
+    except UnicodeError:
+        raise ValueError('Enter a hostname such as example.org.') from None
+    labels = host.removesuffix('.').split('.')
+    if len(host.removesuffix('.')) > 253 or any(
+            not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in labels):
+        raise ValueError('Enter a hostname such as example.org.')
+    try:
+        ipaddress.ip_address(host.removesuffix('.'))
+    except ValueError:
+        return host
+    raise ValueError('Enter a hostname such as example.org.')
+
+
+def edit_target(current, label, prompt, parse, error):
     result = desktop('--entry', '--no-markup', '--width=450',
-                     '--text=Enter an IPv4 or IPv6 address to ping through the selected adapter.',
-                     '--entry-label=IP address', f'--entry-text={current or ""}',
-                     '--button=Cancel:1', '--button=Use defaults:2', '--button=Apply:0')
+                     f'--text={prompt}', f'--entry-label={label}', f'--entry-text={current or ""}',
+                     '--button=Cancel:1', '--button=Clear:2', '--button=Apply:0')
     if result.returncode == 2:
         return None
     if result.returncode != 0:
@@ -117,11 +135,10 @@ def edit_ping_target(current):
     if not value:
         return None
     try:
-        return parse_ping_target(value)
+        return parse(value)
     except ValueError:
         desktop('--image=dialog-error', '--no-markup',
-                '--text=Enter an IP address such as 192.168.1.1 or fe80::1.',
-                '--button=Close:0')
+                f'--text={error}', '--button=Close:0')
         return current
 
 
@@ -142,16 +159,62 @@ def wifi_details(device, profile, details):
     return radio, link if link_code == 0 else ''
 
 
-def gateway_check(device, data):
-    gateways = []
-    for family in (4, 6):
+def ip_json(*args):
+    code, output = run('ip', '-j', *args)
+    if code == 0:
         try:
-            gateways.append(parse_ping_target(data.get(f'IP{family}.GATEWAY', '')))
+            records = json.loads(output)
+            if isinstance(records, list):
+                return [record for record in records if isinstance(record, dict)]
         except ValueError:
             pass
-    if not gateways:
+    return []
+
+
+def gateway_neighbor(device, gateway, family):
+    records = ip_json(f'-{family}', 'neigh', 'show', 'to', gateway, 'dev', device)
+    for entry in records:
+        states = entry.get('state') or []
+        if 'FAILED' in states:
+            return 'neighbor resolution failed'
+        if 'INCOMPLETE' in states:
+            return 'neighbor resolution pending'
+        if entry.get('lladdr'):
+            return 'link-layer address known'
+    return 'neighbor state unknown'
+
+
+def gateway_check(device, data):
+    results, notes = [], []
+    for family in (4, 6):
+        try:
+            gateway = parse_ping_target(data.get(f'IP{family}.GATEWAY', '').removesuffix(f'%{device}'))
+            if ipaddress.ip_address(gateway).version != family:
+                continue
+        except ValueError:
+            continue
+        result = ping_status(device, gateway)
+        observation = result.lower()
+        if result == 'No reply':
+            observation += f', {gateway_neighbor(device, gateway, family)}'
+        results.append(result)
+        notes.append(f'{gateway} ({observation})')
+    if not results:
         return 'Skipped', 'No gateway address was reported for this adapter.'
-    return ping_check(device, gateways)
+    return ping_summary(results, notes)
+
+
+def system_route_check(device):
+    choices, notes = set(), []
+    for family, target in DEFAULT_TARGETS.items():
+        route = ip_json(f'-{family}', 'route', 'get', target)
+        chosen = route[0].get('dev') if route else None
+        if chosen:
+            choices.add('Selected adapter' if chosen == device else 'Other adapter')
+        notes.append(f'IPv{family} to {target} via {chosen}' if chosen else
+                     f'IPv{family} to {target}: no route confirmed')
+    status = 'Mixed' if len(choices) > 1 else next(iter(choices), 'Unverified')
+    return status, ' · '.join(notes)
 
 
 def usb_configuration_classes(descriptors):
@@ -216,10 +279,105 @@ def usb_ethernet_link_hint(device, details):
     return ' '.join(hints)
 
 
-def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
+ETHERNET_COUNTERS = {'carrier_down_count': 'carrier losses',
+                     'statistics/rx_crc_errors': 'receive CRC errors'}
+
+
+def ethernet_value(device, attribute):
+    try:
+        return (SYS_NET / device / attribute).read_text().strip()
+    except OSError:
+        return ''
+
+
+def ethernet_counters(device):
+    index = ethernet_value(device, 'ifindex')
+    counts = {}
+    for attribute, label in ETHERNET_COUNTERS.items():
+        value = ethernet_value(device, attribute)
+        if value.isdecimal():
+            counts[label] = int(value)
+    return index, counts
+
+
+def ethernet_link_details(device, baseline, details, history):
+    speed = ethernet_value(device, 'speed')
+    duplex = ethernet_value(device, 'duplex')
+    link = f'Negotiated link: {int(speed):,} Mbps' if speed.isdecimal() and int(speed) > 0 else ''
+    if duplex in ('half', 'full'):
+        link = f'{link}, {duplex} duplex' if link else f'{duplex.capitalize()} duplex'
+    index, counts = ethernet_counters(device)
+    window = 'During this check'
+    if history is not None:
+        previous = history.get(device)
+        history[device] = index, counts
+        if previous and index and index == previous[0]:
+            baseline = previous
+            window = 'Since the last check'
+    before_index, before = baseline
+    deltas = []
+    if index and index == before_index:
+        deltas = [f'{label} +{count - before[label]}' for label, count in counts.items()
+                  if label in before and count > before[label]]
+    if link or counts:
+        details.append(f'Ethernet link sample ({window.lower()}): {link or "Speed unavailable"}\n'
+                       f'Counters before: {before}\nCounters after: {counts}')
+    observations = [f'{link}.' if link else '']
+    if deltas:
+        observations.append(f'{window}: {", ".join(deltas)}.')
+    return ' '.join(filter(None, observations))
+
+
+def dns_answers(output):
+    for line in output.splitlines():
+        value, _, link = line.partition('-- link:')
+        try:
+            yield ipaddress.ip_address(value.split()[-1]), link.strip()
+        except (ValueError, IndexError):
+            continue
+
+
+def dns_target_check(device, hostname, details):
+    code, domains = run('resolvectl', 'domain', device)
+    details.append(f'DNS domains for selected adapter (exit {code}):\n{domains}')
+    # The CLI prefixes the list with Link N (interface):.
+    domains = domains.partition(':')[2].strip() if code == 0 else ''
+    outcomes = []
+    scoped = False
+    for label, options in (('Selected adapter', ('-i', device)), ('System resolver', ())):
+        code, output = run('resolvectl', *options, '--cache=no', 'query', hostname)
+        details.append(f'{label} DNS lookup for {hostname} (exit {code}):\n{output}')
+        answers = list(dns_answers(output)) if code == 0 else []
+        links = sorted({link for _, link in answers if link})
+        if options:
+            scoped = device in links
+        outcome = f'answer via {", ".join(links)}' if links else (
+            'answer with no reported link' if answers else 'no answer confirmed')
+        outcomes.append(f'{label}: {outcome}.')
+    if domains:
+        outcomes.append(f'Selected adapter DNS domains: {domains}.')
+    return ('Resolved on adapter' if scoped else 'Unverified'), f'{hostname}. {" ".join(outcomes)}'
+
+
+def diagnose(device, kind, ping_target=None, details=None, profile_hint=None, *,
+             dns_target=None, ethernet_history=None):
     details = details if details is not None else []
+    baseline = ethernet_counters(device) if kind == 'Ethernet' else None
+    result = diagnose_adapter(device, kind, ping_target, details, profile_hint)
+    rows = result[1]
+    rows['System route'] = system_route_check(device)
+    if baseline is not None and rows['Link'][0] == 'Up':
+        link = ethernet_link_details(device, baseline, details, ethernet_history)
+        if link:
+            rows['Link'] = ('Up', link)
+    if dns_target:
+        rows['DNS target'] = dns_target_check(device, dns_target, details)
+    return result
+
+
+def diagnose_adapter(device, kind, ping_target, details, profile_hint):
     rows = {step: ('Skipped', 'Requires an active link with an IP address.')
-            for step in ('Link', 'IP address', 'Route', 'Gateway', 'Ping', 'DNS', 'Sign-in', 'Internet')}
+            for step in ('Link', 'IP address', 'Route', 'System route', 'Gateway', 'Ping', 'DNS', 'Sign-in', 'Internet')}
     reconnect = portal = ''
     code, output = run('nmcli', '-t', '-e', 'no', '-f', FIELDS, 'device', 'show', device)
     details.append(f'NetworkManager device snapshot:\n{output}')
@@ -230,6 +388,8 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     fields = [line.split(':', 1) for line in output.splitlines() if ':' in line]
     data = dict(fields)
     state = data.get('GENERAL.STATE', '').partition(' ')[0]
+    reason = re.fullmatch(r'[1-9][0-9]* \((.+)\)', data.get('GENERAL.REASON', ''))
+    reason_note = f' NetworkManager reports: {reason[1]}.' if reason else ''
     profile = data.get('GENERAL.CON-UUID', '')
     if profile and profile != '--':
         reconnect = profile
@@ -247,10 +407,10 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
                     if usb_wake_available(device) else 'Check the Ethernet cable, dock, or switch.')
             if usb_hint:
                 hint = f'{hint} {usb_hint}'
-            rows['Link'] = ('No cable link', hint)
+            rows['Link'] = ('No cable link', hint + reason_note)
             return 'Ethernet link is down', rows, '', portal
         if carrier != 'on':
-            rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.')
+            rows['Link'] = ('Unverified', 'NetworkManager did not report the cable link state.' + reason_note)
             return 'Ethernet link unverified', rows, reconnect, portal
         rows['Link'] = ('Up', 'The adapter detects an Ethernet link.')
     else:
@@ -262,7 +422,7 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
             hint = 'Choose a network in the Wi-Fi menu.'
             if reconnect:
                 hint += ' You can also reconnect the saved profile.'
-            rows['Link'] = ('Disconnected', hint)
+            rows['Link'] = ('Disconnected', hint + reason_note)
             return 'Wi-Fi is disconnected', rows, reconnect, portal
         rows['Link'] = ('Joined', data.get('GENERAL.CONNECTION') or 'Joined a Wi-Fi network.')
 
@@ -271,7 +431,12 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
     if not families:
         if ping_target:
             rows['Ping'] = ping_check(device, [ping_target])
-        rows['IP address'] = ('Missing', 'No address beyond link-local. Check DHCP or the saved IP settings.')
+        if state == '70':
+            rows['IP address'] = ('Pending', 'NetworkManager is still configuring an IP address.' + reason_note)
+            return 'IP configuration is in progress', rows, reconnect, portal
+        hint = 'No address beyond link-local.'
+        hint += reason_note or ' Check DHCP or the saved IP settings.'
+        rows['IP address'] = ('Missing', hint)
         return 'The adapter has no usable IP address', rows, reconnect, portal
     rows['IP address'] = ('Assigned', ', '.join(f'IPv{family}' for family in sorted(families)))
 
@@ -306,16 +471,10 @@ def diagnose(device, kind, ping_target=None, details=None, profile_hint=None):
         code, output = run('resolvectl', '-i', device, '--cache=no',
                            f'--type={record_type}', 'query', TEST_HOST)
         details.append(f'Per-adapter DNS ({record_type}, exit {code}):\n{output}')
-        for line in output.splitlines() if code == 0 else ():
-            value, sep, link = line.partition('-- link:')
-            if sep and link.strip() == device:
-                try:
-                    address = ipaddress.ip_address(value.split()[-1])
-                except (ValueError, IndexError):
-                    continue
-                if address.version == family:
-                    resolved.append(address)
-                    break
+        for address, link in dns_answers(output) if code == 0 else ():
+            if link == device and address.version == family:
+                resolved.append(address)
+                break
     rows['DNS'] = (('Resolved', 'The test site resolved on this adapter.') if resolved else
                    ('Unverified', 'No per-adapter DNS answer. This check needs systemd-resolved.'))
 
@@ -609,13 +768,14 @@ def view_report(path, redacted):
 def show(device, kind, result, repair_notice=''):
     headline, rows, _, portal = result
     buttons = ['--button=Close:0', '--button=Choose adapter:10', '--button=View report:16',
-               '--button=Ping target:14', '--button=Check again:11', '--button=Repair connection:12']
+               '--button=Ping target:14', '--button=DNS target:18',
+               '--button=Check again:11', '--button=Repair connection:12']
     if portal:
         label = 'Open sign-in' if rows['Sign-in'][0] == 'Required' else 'Try sign-in'
         buttons += [f'--button={label}:13']
     cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
     notice = f'\n{escape(repair_notice)}' if repair_notice else ''
-    return desktop('--list', '--width=720', '--height=320', '--text-width=75',
+    return desktop('--list', '--width=760', '--height=370', '--text-width=75',
                    f'--text=<b>{escape(headline)}</b>\n{escape(kind)} · {escape(device)}{notice}',
                    '--text-align=left', '--response=0', '--no-selection', '--grid-lines=horizontal',
                    '--column=Check', '--column=Result', '--column=Details',
@@ -645,6 +805,8 @@ def main():
     parser.add_argument('--device', help='adapter to check')
     parser.add_argument('--profile', metavar='UUID', help='saved NetworkManager profile for --configure-recovery')
     parser.add_argument('--ping-target', type=parse_ping_target, help='override the public ping targets')
+    parser.add_argument('--dns-target', type=parse_dns_target, metavar='HOSTNAME',
+                        help='compare DNS resolution for a hostname on the selected adapter and system resolver')
     report_mode = parser.add_mutually_exclusive_group()
     report_mode.add_argument('--report', action='store_true', help='print the private report')
     report_mode.add_argument('--redacted-report', action='store_true', help='print a shareable report')
@@ -654,7 +816,7 @@ def main():
     if args.configure_recovery is not None:
         if not args.device or not args.profile:
             parser.error('--configure-recovery requires --device and --profile')
-        if args.ping_target or args.report or args.redacted_report:
+        if args.ping_target or args.dns_target or args.report or args.redacted_report:
             parser.error('--configure-recovery does not run diagnostics or generate a report')
         try:
             path = configure_recovery(args.device, args.profile, args.configure_recovery)
@@ -664,7 +826,7 @@ def main():
         return 0
     if args.profile is not None:
         parser.error('--profile requires --configure-recovery')
-    ping_target = args.ping_target
+    ping_target, dns_target = args.ping_target, args.dns_target
 
     def activity(message, operation):
         if args.gui:
@@ -678,12 +840,14 @@ def main():
     path = before = snapshot = None
     history = repair_notice = ''
     steps = []
+    ethernet_history = {}
 
     def scan():
         details = []
         hint = config[1] if config and config[0] == device else None
         result = activity('Checking this adapter…',
-                          lambda: diagnose(device, kind, ping_target, details, hint))
+                          lambda: diagnose(device, kind, ping_target, details, hint,
+                                           dns_target=dns_target, ethernet_history=ethernet_history))
         recovery = configured_recovery(device, kind, config, result[2])
         return result, recovery, report_text(device, kind, result, details, config if hint else None)
 
@@ -709,7 +873,8 @@ def main():
                 print(*row, sep='\t')
             if not args.list_adapters:
                 print('Run again with --device ADAPTER.', file=sys.stderr)
-            return int(not args.list_adapters and (args.repair or args.sign_in or args.report or args.redacted_report))
+            return int(not args.list_adapters and (
+                args.repair or args.sign_in or args.report or args.redacted_report or bool(args.dns_target)))
         if not device:
             device = choose(devices) if args.gui else devices[0][0]
             if not device:
@@ -738,7 +903,14 @@ def main():
             steps = []
             continue
         if action == 14:
-            ping_target = edit_ping_target(ping_target)
+            ping_target = edit_target(
+                ping_target, 'IP address', 'Enter an IPv4 or IPv6 address to ping through the selected adapter.',
+                parse_ping_target, 'Enter an IP address such as 192.168.1.1 or fe80::1.')
+            continue
+        if action == 18:
+            dns_target = edit_target(
+                dns_target, 'Hostname', 'Enter the hostname that fails to resolve.',
+                parse_dns_target, 'Enter a hostname such as example.org.')
             continue
         if action == 11:
             repair_notice = ''
