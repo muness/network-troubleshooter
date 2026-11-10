@@ -19,7 +19,7 @@ The installer puts the CLI in `~/.local/bin`. Add that directory to your `PATH` 
 ## Run a diagnosis
 
 1. Open **Network Troubleshooter** from your app launcher and select the Wi-Fi or Ethernet adapter you want to check.
-2. Read the results from **Link** through **Internet**. Use **Open sign-in** if the network requires a login.
+2. Read the results from **Link** through **Internet**. Use **Launch portal** if the network requires a login.
 3. Choose **Repair connection** to retry a saved NetworkManager profile or wake a suspended USB Ethernet adapter. If repair is unavailable, the app explains what to check first. After an attempt, the app checks internet access through the selected adapter and records each step in the private report.
 4. To share results, choose **View report** → **Copy redacted**. The redacted report contains check statuses and repair outcomes. The private report includes adapter details and journal logs and is saved under `${XDG_STATE_HOME:-$HOME/.local/state}/network-troubleshooter/`.
 
@@ -54,16 +54,16 @@ network-troubleshooter --device enp2s0
 network-troubleshooter --device enp2s0 --ping-target 192.168.1.1 --redacted-report
 network-troubleshooter --device enp2s0 --dns-target service.example.org
 network-troubleshooter --device enp2s0 --repair --redacted-report
-network-troubleshooter --device wlan0 --sign-in
+network-troubleshooter --device wlan0 --launch-portal
 ```
 
 Add `--yes` to approve repair in a script. A configured driver recovery service may still prompt through polkit. Use `--redacted-report` for shareable output and `--report` for private details. Both print to stdout and send the saved private report path to stderr.
 
 ## Sign in to a captive portal
 
-Choose **Open sign-in** when the app detects a portal. If **Try sign-in** appears, the app can open the HTTP probe page to trigger a portal redirect even though the check couldn’t confirm one. After signing in, reopen Network Troubleshooter and check the same adapter again.
+Choose **Launch portal** when the app detects a portal on the selected adapter. If **Try sign-in** appears, the app can open the HTTP probe page to trigger a portal redirect even though the check couldn’t confirm one. The results window stays on the same adapter. After signing in, select **Check again**.
 
-![Network Troubleshooter showing a sample guest Wi-Fi diagnosis with the Open sign-in button](docs/images/wifi-sign-in.png)
+![Network Troubleshooter showing a sample guest Wi-Fi diagnosis with a sign-in action](docs/images/wifi-sign-in.png)
 
 By default, the app sends the probe URL to Omarchy’s `omarchy-network-captive-portal` if it’s on your `PATH`. That launcher can pause an active Tailscale exit node during sign-in. Otherwise, the app opens the URL in your default browser with `xdg-open`. Both use normal system routing.
 

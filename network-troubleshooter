@@ -533,7 +533,7 @@ def launch_portal(device, kind, url):
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         return 2, str(error)
-    return 0, 'Opened the system sign-in helper.'
+    return 0, 'Started the system portal launcher. It uses system routing.'
 
 
 def recovery_settings():
@@ -771,7 +771,7 @@ def show(device, kind, result, repair_notice=''):
                '--button=Ping target:14', '--button=DNS target:18',
                '--button=Check again:11', '--button=Repair connection:12']
     if portal:
-        label = 'Open sign-in' if rows['Sign-in'][0] == 'Required' else 'Try sign-in'
+        label = 'Launch portal' if rows['Sign-in'][0] == 'Required' else 'Try sign-in'
         buttons += [f'--button={label}:13']
     cells = [escape(cell) for step, (state, detail) in rows.items() for cell in (step, state, detail)]
     notice = f'\n{escape(repair_notice)}' if repair_notice else ''
@@ -799,7 +799,8 @@ def main():
     mode.add_argument('--gui', action='store_true', help='open the desktop interface')
     mode.add_argument('--list-adapters', action='store_true', help='list managed Wi-Fi and Ethernet adapters')
     mode.add_argument('--repair', action='store_true', help='repair the selected adapter after confirmation')
-    mode.add_argument('--sign-in', action='store_true', help='open sign-in if needed on the selected adapter')
+    mode.add_argument('--sign-in', '--launch-portal', action='store_true',
+                      help='launch the captive portal for the selected adapter')
     mode.add_argument('--configure-recovery', metavar='UNIT', help='save an installed driver recovery service')
     parser.add_argument('--yes', action='store_true', help='confirm --repair without prompting')
     parser.add_argument('--device', help='adapter to check')
@@ -972,7 +973,7 @@ def main():
                 if code:
                     repair_notice = 'Repair stopped. View the report for the steps and error.'
                 elif result[1]['Sign-in'][0] == 'Required':
-                    code, output = 1, 'The connection is up. Open sign-in to get internet access.'
+                    code, output = 1, 'The connection is up. Launch the portal to get internet access.'
                     repair_notice = output
                 elif result[1]['Internet'][0] != 'Reached':
                     code, output = 1, 'The reconnect command finished, but this adapter did not pass the internet check.'
@@ -991,11 +992,21 @@ def main():
                 code, output = 1, 'Repair cancelled.'
         elif action == 13:
             if result[3]:
-                code, output = launch_portal(device, kind, result[3])
-                steps.append(('Open sign-in', code, output))
+                code, output = activity('Launching the portal…',
+                                        lambda: launch_portal(device, kind, result[3]))
+                steps.append(('Launch portal', code, output))
                 history = f'\n\nSign-in handoff (exit {code}):\n{output}{history}'
                 path.write_text(private + history + '\n', encoding='utf-8')
                 redacted = redacted_report(kind, result, steps, before)
+                if args.gui:
+                    snapshot = result, recovery, private
+                if code == 0:
+                    notice = output or 'Started the portal launcher.'
+                    notice += ' After signing in, check this adapter again.'
+                    if args.gui:
+                        repair_notice = notice
+                        continue
+                    print(notice, file=sys.stderr)
             else:
                 code, output = 1, 'This check did not find a sign-in page to open.'
 
