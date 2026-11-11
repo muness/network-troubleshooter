@@ -106,13 +106,11 @@ Run `lspci -nnk -d 14e4:` to find the PCI ID and check for `Kernel driver in use
 
 If joins also fail right after a fresh boot, check whether an older Omarchy installation set `feature_disable=0x82000` in `/etc/modprobe.d/brcmfmac.conf`. That setting caused association failures on BCM4387. Follow the Omarchy cleanup instructions for that case. [Omarchy Apple Silicon troubleshooting](https://omarchylinux.org/hardware/apple-silicon-asahi/) · [BCM4387 report](https://github.com/omacom/omarchy/issues/7439)
 
-If you already have a guarded recovery service for your chip, use its unit name in the next section. The Broadcom helper below detaches NetworkManager and wpa_supplicant before unloading the driver, then restores NetworkManager management. These commands install it and disable its automatic wake hook so it runs on demand from **Repair connection**. [Helper source](https://github.com/muness/dotfiles/tree/53aacf6c6606a88b7d0acaca6a9d5dbf58e2e60e/scripts/linux/wifi-resume)
+The optional Broadcom helper is included in `broadcom-recovery/`. It detaches NetworkManager and wpa_supplicant before reloading the driver, then restores management. Install it and disable automatic wake recovery to use it on demand:
 
 ```sh
-git clone https://github.com/muness/dotfiles.git broadcom-recovery &&
-  git -C broadcom-recovery checkout 53aacf6c6606a88b7d0acaca6a9d5dbf58e2e60e &&
-  pkexec /usr/bin/python3 "$PWD/broadcom-recovery/scripts/linux/wifi-resume/install.py" &&
-  pkexec /usr/bin/systemctl disable dotfiles-wifi-resume.service
+pkexec /usr/bin/python3 "$PWD/broadcom-recovery/install.py"
+pkexec /usr/bin/systemctl disable dotfiles-wifi-resume.service
 ```
 
 Use `dotfiles-wifi-resume.service` in the next step. The reload briefly removes the Wi-Fi adapter. Check the service log with `journalctl -b -u dotfiles-wifi-resume.service`.
